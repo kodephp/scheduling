@@ -22,6 +22,11 @@
     "require-dev": {
         "phpunit/phpunit": "^11.0"
     },
+    "suggest": {
+        "kode/fibers": "开启 FibersRunner：基于协程池的高并发任务执行（I/O 密集型）",
+        "kode/parallel": "开启 ParallelRunner：基于多线程/多进程池的并行执行（CPU 密集型）",
+        "kode/process": "开启分布式能力：ProcessMutex 跨节点互斥锁 + LeaderCoordinator 集群派发"
+    },
     "autoload": {
         "psr-4": {
             "Kode\\Scheduling\\": "src/"

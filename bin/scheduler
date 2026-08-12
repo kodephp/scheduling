@@ -27,13 +27,27 @@ foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php
     }
 }
 
+use Kode\Scheduling\Coordinator\LeaderCoordinator;
+use Kode\Scheduling\Mutex\ProcessMutex;
+use Kode\Scheduling\Runner\FibersRunner;
+use Kode\Scheduling\Runner\ParallelRunner;
 use Kode\Scheduling\Scheduler;
 
 /** 解析命令行参数。 */
 function parse_args(array $argv): array
 {
     $command = $argv[1] ?? 'run';
-    $options = ['schedule' => \getcwd() . \DIRECTORY_SEPARATOR . 'schedule.php', 'env' => '', 'tz' => ''];
+    $options = [
+        'schedule' => \getcwd() . \DIRECTORY_SEPARATOR . 'schedule.php',
+        'env' => '',
+        'tz' => '',
+        'runner' => 'sync',     // sync | fibers | parallel
+        'distributed' => false,  // 启用 kode/process 的分布式锁 + Leader 选举
+        'backend' => '',         // 分布式存储后端：redis / file / globaldata
+        'concurrency' => '0',
+        'engine' => '',          // parallel 引擎：parallel | process
+        'bootstrap' => '',       // parallel 进程引擎引导文件
+    ];
     for ($i = 2; $i < \count($argv); $i++) {
         if (\str_starts_with($argv[$i], '--')) {
             $kv = \substr($argv[$i], 2);
@@ -80,6 +94,43 @@ if ($options['tz'] !== '') {
 }
 if ($options['env'] !== '') {
     $scheduler->environment($options['env']);
+}
+
+// 分布式模式：启用 kode/process 的分布式锁 + Leader 选举（需先 composer require kode/process）
+if ($options['distributed'] !== false) {
+    if (\class_exists(\Kode\Process\Cluster::class) === false) {
+        \fwrite(\STDERR, "分布式模式需要 kode/process：composer require kode/process\n");
+        exit(1);
+    }
+    if ($options['backend'] !== '') {
+        \Kode\Process\Cluster::make($options['backend'], []);
+    }
+    $scheduler->setMutex(new ProcessMutex());
+    $scheduler->setCoordinator(new LeaderCoordinator());
+    echo "[分布式] 已启用 ProcessMutex + LeaderCoordinator（后端：{$options['backend']}）\n";
+}
+
+// 执行器：sync（默认）/ fibers / parallel
+$runnerName = \is_string($options['runner']) ? $options['runner'] : 'sync';
+if ($runnerName === 'fibers') {
+    try {
+        $scheduler->setRunner(new FibersRunner());
+    } catch (\Kode\Scheduling\Exception\SchedulingError $e) {
+        \fwrite(\STDERR, $e->getMessage() . "\n");
+        exit(1);
+    }
+    echo "[执行器] FibersRunner（kode/fibers 协程池）\n";
+} elseif ($runnerName === 'parallel') {
+    try {
+        $engine = $options['engine'] === '' ? null : (string) $options['engine'];
+        $bootstrap = $options['bootstrap'] === '' ? null : (string) $options['bootstrap'];
+        $scheduler->setRunner(new ParallelRunner((int) $options['concurrency'], $engine, $bootstrap));
+    } catch (\Kode\Scheduling\Exception\SchedulingError $e) {
+        \fwrite(\STDERR, $e->getMessage() . "\n");
+        exit(1);
+    }
+    $conc = (int) $options['concurrency'];
+    echo "[执行器] ParallelRunner（kode/parallel，并发={$conc}，引擎={$engine}）\n";
 }
 
 $now = new \DateTimeImmutable('now', new \DateTimeZone(\date_default_timezone_get()));

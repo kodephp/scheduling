@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Kode\Scheduling;
 
+use Kode\Scheduling\Contract\MutexInterface;
 use Kode\Scheduling\Exception\TaskError;
+use Kode\Scheduling\Mutex\FileMutex;
 
 /**
  * 任务封装：把“任意 callable”包装成一个可被调度器识别、可流畅配置的执行单元。
@@ -39,11 +41,17 @@ final class Task
 
     private ?\DateTimeZone $timezone = null;
 
-    /** 是否开启防重叠（文件锁）。 */
+    /** 是否开启防重叠（互斥锁）。 */
     private bool $overlapping = false;
 
-    /** 自定义锁路径；为 null 时使用默认临时目录。 */
-    private ?string $lockPath = null;
+    /** 互斥锁逻辑键；为 null 时按任务名自动生成。 */
+    private ?string $lockKey = null;
+
+    /** 防重叠锁存活时长（秒）；必须大于任务预期耗时，避免锁提前过期导致双跑。 */
+    private float $overlapTtlSeconds = 30.0;
+
+    /** 防重叠用的互斥锁实现；为 null 时由 Scheduler 注入，或惰性回退到默认文件锁。 */
+    private ?MutexInterface $mutex = null;
 
     /** 允许执行的环境列表；为空表示不限环境。 */
     private array $environments = [];
@@ -300,15 +308,40 @@ final class Task
         return $this;
     }
 
-    /** 开启防重叠；可选自定义锁文件路径。 */
-    public function withoutOverlapping(?string $path = null): static
+    /** 开启防重叠；可选自定义锁逻辑键（分布式锁名 / 文件锁标识）。 */
+    public function withoutOverlapping(?string $key = null): static
     {
         $this->overlapping = true;
-        if ($path !== null) {
-            $this->lockPath = $path;
+        if ($key !== null) {
+            $this->lockKey = $key;
         }
 
         return $this;
+    }
+
+    /** 设置防重叠锁的存活时长（秒）；大于任务预期耗时可避免锁提前过期。 */
+    public function overlapTtl(float $seconds): static
+    {
+        if ($seconds <= 0) {
+            throw TaskError::for($this->name, 'overlapTtl() 必须为正数');
+        }
+        $this->overlapTtlSeconds = $seconds;
+
+        return $this;
+    }
+
+    /** 注入互斥锁实现（通常由 Scheduler 在注册任务时自动完成）。 */
+    public function setMutex(MutexInterface $mutex): static
+    {
+        $this->mutex = $mutex;
+
+        return $this;
+    }
+
+    /** 返回任务回调（供并行执行器在隔离单元中调用）。 */
+    public function callback(): callable
+    {
+        return $this->callback;
     }
 
     /** 限定仅在指定环境运行（与 Scheduler 的当前环境比对）。 */
@@ -465,12 +498,14 @@ final class Task
 
         $lock = null;
         if ($this->overlapping) {
-            $lock = new Lock($this->lockPath());
-            if (!$lock->acquire()) {
+            $mutex = $this->mutex ??= new FileMutex();
+            $key = $this->lockKey();
+            if (!$mutex->acquire($key, \max(1.0, $this->overlapTtlSeconds()))) {
                 $this->lastSkipReason = 'overlap';
 
                 return null; // 已有实例在运行，本次跳过
             }
+            $lock = $key; // 标记已持锁，finally 中据此释放
         }
         $this->lastSkipReason = null;
 
@@ -495,7 +530,7 @@ final class Task
                 }
             }
             if ($lock !== null) {
-                $lock->release();
+                ($this->mutex ?? new FileMutex())->release($lock);
             }
         }
     }
@@ -578,14 +613,20 @@ final class Task
         return [(string) $m, (string) $h];
     }
 
-    /** 锁文件路径。 */
-    private function lockPath(): string
+    /** 防重叠锁逻辑键（文件锁会据此映射成文件路径，分布式锁据此命名）。 */
+    private function lockKey(): string
     {
-        if ($this->lockPath !== null) {
-            return $this->lockPath;
+        if ($this->lockKey !== null) {
+            return $this->lockKey;
         }
 
-        return \sys_get_temp_dir() . \DIRECTORY_SEPARATOR . 'kode-scheduling-' . \md5($this->name) . '.lock';
+        return 'kode:scheduling:overlap:' . \sha1($this->name);
+    }
+
+    /** 防重叠锁存活时长（秒）。 */
+    private function overlapTtlSeconds(): float
+    {
+        return $this->overlapTtlSeconds;
     }
 
     /** 条件钩子是否允许执行。 */

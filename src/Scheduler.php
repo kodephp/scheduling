@@ -4,7 +4,13 @@ declare(strict_types=1);
 
 namespace Kode\Scheduling;
 
+use Kode\Scheduling\Contract\CoordinatorInterface;
+use Kode\Scheduling\Contract\MutexInterface;
+use Kode\Scheduling\Contract\RunnerInterface;
+use Kode\Scheduling\Coordinator\LocalCoordinator;
 use Kode\Scheduling\Exception\TaskError;
+use Kode\Scheduling\Mutex\FileMutex;
+use Kode\Scheduling\Runner\SyncRunner;
 
 /**
  * 调度器：任务的注册中心与执行引擎。
@@ -48,6 +54,15 @@ final class Scheduler
 
     /** keepAlive 守护循环是否继续运行。 */
     private bool $keepRunning = false;
+
+    /** 执行器：决定“如何跑”到期任务（同步/协程/并行）。 */
+    private ?RunnerInterface $runner = null;
+
+    /** 互斥锁：决定“如何在防重叠时互斥”（本地文件/分布式）。 */
+    private ?MutexInterface $mutex = null;
+
+    /** 协调器：决定“本节点是否应当派发”（单机/集群 Leader）。 */
+    private ?CoordinatorInterface $coordinator = null;
 
     /**
      * @param \DateTimeZone|null $timezone 调度器基准时区（用于解析“现在”）
@@ -103,6 +118,52 @@ final class Scheduler
         $this->afterRuns[] = $callback;
 
         return $this;
+    }
+
+    // ------------------------------------------------------------------
+    // 执行模型（可替换的执行器 / 互斥锁 / 协调器）
+    // ------------------------------------------------------------------
+
+    /** 设置执行器（线程/协程/并行模型）。默认 SyncRunner（顺序同步）。 */
+    public function setRunner(RunnerInterface $runner): static
+    {
+        $this->runner = $runner;
+
+        return $this;
+    }
+
+    /** 设置互斥锁实现（防重叠）。默认 FileMutex（本机文件锁）。 */
+    public function setMutex(MutexInterface $mutex): static
+    {
+        $this->mutex = $mutex;
+
+        return $this;
+    }
+
+    /** 设置协调器（单节点 / 集群 Leader）。默认 LocalCoordinator（恒派发）。 */
+    public function setCoordinator(CoordinatorInterface $coordinator): static
+    {
+        $this->coordinator = $coordinator;
+
+        return $this;
+    }
+
+    /** 当前执行器（惰性默认 SyncRunner）。 */
+    public function runner(): RunnerInterface
+    {
+        return $this->runner ??= new SyncRunner();
+    }
+
+    /** 当前互斥锁（惰性默认 FileMutex，且会注入到所有任务）。 */
+    public function mutex(): MutexInterface
+    {
+        return $this->mutex ??= new FileMutex();
+    }
+
+    /** 当前协调器（惰性默认 LocalCoordinator）。 */
+    public function coordinator(): CoordinatorInterface
+    {
+        return $this->coordinator ??= new LocalCoordinator();
     }
 
     // ------------------------------------------------------------------
@@ -194,30 +255,46 @@ final class Scheduler
             $cb($now);
         }
 
+        // 1) 协调器裁决：非派发节点（如集群非 Leader）本次直接空转
+        $this->coordinator()->tick();
+        if (!$this->coordinator()->shouldDispatch()) {
+            $report->setDispatched(false);
+            foreach ($this->afterRuns as $cb) {
+                $cb($report);
+            }
+
+            return $report;
+        }
+
+        // 2) 收集到期且应执行的任务（环境/条件/时间窗口不满足的记为跳过）
+        $runnable = [];
         foreach ($this->tasks as $task) {
             if (!$task->isDue($now)) {
-                continue; // 未到期，直接跳过
+                continue; // 未到期，直接跳过（不计入报告）
             }
             if (!$task->shouldRun($now, $this->environment)) {
                 $report->addSkipped($task->name(), 'condition');
 
                 continue;
             }
+            $runnable[] = $task;
+        }
 
-            try {
-                $result = $task->run($now);
-                if ($task->lastSkipReason() === 'overlap') {
-                    $report->addSkipped($task->name(), 'overlap');
-                } else {
-                    $report->addSuccess($task->name(), $result);
-                }
-            } catch (\Throwable $e) {
-                $report->addFailure($task->name(), $e);
+        // 3) 交给执行器批量执行（同步/协程/并行），单任务失败不影响其余
+        $outcomes = $this->runner()->runAll($runnable, $now);
+        foreach ($outcomes as $outcome) {
+            if ($outcome->succeeded()) {
+                $report->addSuccess($outcome->name, $outcome->result);
+            } elseif ($outcome->skipped()) {
+                $report->addSkipped($outcome->name, $outcome->skipReason ?? 'condition');
+            } else {
+                $report->addFailure($outcome->name, $outcome->error ?? TaskError::for($outcome->name, '未知执行错误'));
                 if ($this->errorHandler !== null) {
-                    ($this->errorHandler)($task, $e);
+                    $failed = $this->find($outcome->name);
+                    ($this->errorHandler)($failed ?? $outcome->name, $outcome->error);
                 }
                 if ($this->stopOnError) {
-                    throw TaskError::for($task->name(), '执行失败且已开启 stopOnError', 0, $e);
+                    throw TaskError::for($outcome->name, '执行失败且已开启 stopOnError', 0, $outcome->error);
                 }
             }
         }
@@ -275,6 +352,9 @@ final class Scheduler
 
     private function register(Task $task): Task
     {
+        // 注入当前互斥锁实现，使 withoutOverlapping() 在分布式下也能生效
+        $task->setMutex($this->mutex());
+
         $this->tasks[] = $task;
 
         return $task;

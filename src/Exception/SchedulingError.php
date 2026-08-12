@@ -10,4 +10,16 @@ namespace Kode\Scheduling\Exception;
  */
 class SchedulingError extends \Exception
 {
+    /**
+     * 通用构造工厂。
+     *
+     * @param string         $component 出错的组件/位置（如 'FibersRunner'、'ProcessMutex'）
+     * @param string         $reason    错误原因
+     * @param int            $code      错误码
+     * @param \Throwable|null $previous 上游异常
+     */
+    public static function for(string $component, string $reason, int $code = 0, ?\Throwable $previous = null): self
+    {
+        return new self(\sprintf('[%s] %s', $component, $reason), $code, $previous);
+    }
 }

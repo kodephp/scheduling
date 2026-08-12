@@ -21,12 +21,27 @@ final class RunReport
     /** @var array<string, string> 任务名 => 跳过原因（condition/overlap） */
     private array $skipped = [];
 
+    /** 本节点本次是否真正派发了任务（被协调器否决时为 false，如非集群 Leader）。 */
+    private bool $dispatched = true;
+
     /**
      * @param \DateTimeImmutable $ranAt 本次运行的基准时刻
      */
     public function __construct(
         private \DateTimeImmutable $ranAt
     ) {
+    }
+
+    /** 标记本节点本次是否真正派发（默认 true）。 */
+    public function setDispatched(bool $dispatched): void
+    {
+        $this->dispatched = $dispatched;
+    }
+
+    /** 本节点本次是否真正派发了任务。 */
+    public function wasDispatched(): bool
+    {
+        return $this->dispatched;
     }
 
     /** 本次运行的基准时刻。 */
