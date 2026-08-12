@@ -9,8 +9,16 @@ use Kode\Scheduling\Exception\CronExpressionError;
 /**
  * Cron 表达式解析与匹配。
  *
- * 支持标准 5 段式表达式：
- *   分 时 日 月 周
+ * 支持两种精度：
+ *   - 5 段（分钟精度，标准 Vixie cron）：  分 时 日 月 周
+ *   - 6 段（秒级精度，Quartz 风格）：    秒 分 时 日 月 周
+ *
+ * 为什么支持“秒”而不支持“毫秒”？
+ *   本库是墙钟（wall-clock）定时调度：由系统 crontab 每分钟触发，或常驻
+ *   keepAlive 守护循环驱动。最小有意义的调度粒度就是“秒”——再细到毫秒需要
+ *   密集轮询、徒增 CPU 开销，而 PHP 又非实时系统，毫秒级触发本就不精确。
+ *   因此本库最高支持到秒，主动放弃毫秒。
+ *
  * 每段可使用的语法：
  *   *          任意值
  *   a-b        范围（含端点）
@@ -19,7 +27,7 @@ use Kode\Scheduling\Exception\CronExpressionError;
  *   a-b/n      范围内步进
  *   star/n     从起点开始每 n 个（即 "星号 除号 n"）
  * 月与周支持英文缩写（JAN..DEC、SUN..SAT，大小写不限）。
- * 另支持 @yearly/@annually/@monthly/@weekly/@daily/@hourly 宏。
+ * 另支持 @yearly/@annually/@monthly/@weekly/@daily/@hourly 宏（均为分钟精度）。
  *
  * 关于「日」与「周」的特殊规则（遵循 Vixie cron）：
  *   当日字段与周字段同时为限定值时，二者为“或”关系——
@@ -27,31 +35,33 @@ use Kode\Scheduling\Exception\CronExpressionError;
  */
 final class Cron
 {
-    /** 5 个字段的键名，顺序固定。 */
-    private const FIELDS = ['minute', 'hour', 'day', 'month', 'weekday'];
+    /** 字段键名（6 段时含 second，5 段时从 minute 起）。 */
+    private const FIELDS_6 = ['second', 'minute', 'hour', 'day', 'month', 'weekday'];
+    private const FIELDS_5 = ['minute', 'hour', 'day', 'month', 'weekday'];
 
     /** 每个字段的合法取值区间 [min, max]。 */
-    private const RANGES = [
-        'minute' => [0, 59],
-        'hour'   => [0, 23],
-        'day'    => [1, 31],
-        'month'  => [1, 12],
+    private const array RANGES = [
+        'second'  => [0, 59],
+        'minute'  => [0, 59],
+        'hour'    => [0, 23],
+        'day'     => [1, 31],
+        'month'   => [1, 12],
         'weekday' => [0, 7], // 0 与 7 均表示周日
     ];
 
     /** 月份英文缩写（大写）映射。 */
-    private const MONTH_NAMES = [
+    private const array MONTH_NAMES = [
         'JAN' => 1, 'FEB' => 2, 'MAR' => 3, 'APR' => 4, 'MAY' => 5, 'JUN' => 6,
         'JUL' => 7, 'AUG' => 8, 'SEP' => 9, 'OCT' => 10, 'NOV' => 11, 'DEC' => 12,
     ];
 
     /** 星期英文缩写（大写）映射。 */
-    private const WEEKDAY_NAMES = [
+    private const array WEEKDAY_NAMES = [
         'SUN' => 0, 'MON' => 1, 'TUE' => 2, 'WED' => 3, 'THU' => 4, 'FRI' => 5, 'SAT' => 6,
     ];
 
     /** 常用宏，展开为完整 5 段表达式。 */
-    private const MACROS = [
+    private const array MACROS = [
         '@yearly'   => '0 0 1 1 *',
         '@annually' => '0 0 1 1 *',
         '@monthly'  => '0 0 1 * *',
@@ -63,14 +73,17 @@ final class Cron
     /** 每个字段解析后的“允许取值集合”（已去重、已排序）。 */
     private array $allowed;
 
-    /** 规范化后的 5 段原始字符串（宏展开后），用于可读描述。 */
+    /** 规范化后的原始表达式片段（宏展开后），用于可读描述。 */
     private array $normalized = [];
+
+    /** 是否包含秒字段（6 段）。 */
+    private bool $hasSeconds = false;
 
     /** 原始表达式字符串（用于报错与展示）。 */
     private string $raw;
 
     /**
-     * @param string $expression 5 段表达式或 @宏
+     * @param string $expression 5 段或 6 段表达式，或 @宏
      * @throws CronExpressionError 表达式非法时
      */
     public function __construct(string $expression)
@@ -84,12 +97,15 @@ final class Cron
         }
 
         $segments = preg_split('/\s+/', $expr);
-        if ($segments === false || count($segments) !== 5) {
-            throw CronExpressionError::for($expression, '必须为 5 段（分 时 日 月 周），或用 @宏');
+        if ($segments === false || (count($segments) !== 5 && count($segments) !== 6)) {
+            throw CronExpressionError::for($expression, '必须为 5 段（分 时 日 月 周）或 6 段（秒 分 时 日 月 周），或用 @宏');
         }
 
+        $this->hasSeconds = count($segments) === 6;
+        $fields = $this->hasSeconds ? self::FIELDS_6 : self::FIELDS_5;
+
         $this->allowed = [];
-        foreach (self::FIELDS as $i => $name) {
+        foreach ($fields as $i => $name) {
             $this->allowed[$name] = $this->parseField($segments[$i], $name, $expression);
         }
 
@@ -109,11 +125,17 @@ final class Cron
      */
     public function isDue(\DateTimeInterface $now): bool
     {
+        $second  = (int) $now->format('s');
         $minute  = (int) $now->format('i');
         $hour    = (int) $now->format('G');
         $day     = (int) $now->format('j');
         $month   = (int) $now->format('n');
         $weekday = (int) $now->format('w'); // 0=周日 .. 6=周六
+
+        // 秒（仅 6 段表达式需要判定；5 段时秒恒匹配）
+        if ($this->hasSeconds && !$this->inField('second', $second)) {
+            return false;
+        }
 
         // 分、时、月必须全部命中（与关系）
         if (!$this->inField('minute', $minute)) {
@@ -152,9 +174,17 @@ final class Cron
      */
     public function nextRun(\DateTimeInterface $from): \DateTimeImmutable
     {
-        // 从“下一分钟（秒归零）”开始搜索，确保返回的是严格晚于 $from 的下一次
-        $cursor = \DateTimeImmutable::createFromInterface($from)->modify('+1 minute');
-        $cursor = $cursor->setTime((int) $cursor->format('H'), (int) $cursor->format('i'), 0);
+        if ($this->hasSeconds) {
+            // 秒级：从“下一秒（微秒归零）”开始逐秒搜索
+            $next = \DateTimeImmutable::createFromInterface($from)->modify('+1 second');
+            $cursor = $next->setTime((int) $next->format('H'), (int) $next->format('i'), (int) $next->format('s'), 0);
+            $step = '+1 second';
+        } else {
+            // 分钟级：从“下一分钟（秒归零）”开始逐分钟搜索
+            $cursor = \DateTimeImmutable::createFromInterface($from)->modify('+1 minute');
+            $cursor = $cursor->setTime((int) $cursor->format('H'), (int) $cursor->format('i'), 0);
+            $step = '+1 minute';
+        }
 
         $limit = $cursor->modify('+5 years');
 
@@ -162,7 +192,7 @@ final class Cron
             if ($this->isDue($cursor)) {
                 return $cursor;
             }
-            $cursor = $cursor->modify('+1 minute');
+            $cursor = $cursor->modify($step);
         }
 
         throw CronExpressionError::for($this->raw, '未来 5 年内未找到匹配时刻');
@@ -174,14 +204,30 @@ final class Cron
         return $this->raw;
     }
 
+    /** 是否包含秒字段（6 段表达式）。 */
+    public function hasSeconds(): bool
+    {
+        return $this->hasSeconds;
+    }
+
     /**
      * 输出人类可读的中文描述（尽力而为；非常规模式会回退为原始表达式）。
      */
     public function describe(): string
     {
-        [$minute, $hour, $day, $month, $weekday] = $this->normalized;
+        $offset = $this->hasSeconds ? 1 : 0;
+        $second = $this->hasSeconds ? $this->normalized[0] : '*';
+        $minute = $this->normalized[$offset];
+        $hour   = $this->normalized[$offset + 1];
+        $day    = $this->normalized[$offset + 2];
+        $month  = $this->normalized[$offset + 3];
+        $weekday = $this->normalized[$offset + 4];
 
         $parts = [];
+        $sec = $this->describeSecond($second);
+        if ($sec !== '') {
+            $parts[] = $sec;
+        }
         $wd = $this->describeWeekday($weekday);
         if ($wd !== '') {
             $parts[] = $wd;
@@ -199,6 +245,22 @@ final class Cron
         return \implode('，', $parts);
     }
 
+    /** 秒字段的中文描述（仅 6 段表达式有意义）。 */
+    private function describeSecond(string $second): string
+    {
+        if ($second === '*') {
+            return '';
+        }
+        if (\preg_match('#^\*/(\d+)$#', $second, $m)) {
+            return '每 ' . $m[1] . ' 秒';
+        }
+        if (\preg_match('#^\d+$#', $second)) {
+            return '第 ' . $second . ' 秒';
+        }
+
+        return '秒[' . $second . ']';
+    }
+
     /** 时间字段的中文描述。 */
     private function describeTime(string $minute, string $hour): string
     {
@@ -206,7 +268,7 @@ final class Cron
         $allHour = $this->isAll('hour', 0, 23);
 
         if ($allMin && $allHour) {
-            return '每分钟';
+            return $this->hasSeconds ? '每秒' : '每分钟';
         }
         // 每 n 分钟：分字段为 */n，时字段为 *
         if ($allHour && \preg_match('#^\*/(\d+)$#', $minute, $m)) {

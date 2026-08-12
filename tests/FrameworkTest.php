@@ -8,27 +8,26 @@ use Kode\Scheduling\Contract\CoordinatorInterface;
 use Kode\Scheduling\Contract\MutexInterface;
 use Kode\Scheduling\Contract\RunnerInterface;
 use Kode\Scheduling\Coordinator\LocalCoordinator;
-use Kode\Scheduling\Exception\SchedulingError;
 use Kode\Scheduling\Mutex\FileMutex;
-use Kode\Scheduling\Runner\FibersRunner;
-use Kode\Scheduling\Runner\ParallelRunner;
 use Kode\Scheduling\Runner\SyncRunner;
 use Kode\Scheduling\Scheduler;
 use Kode\Scheduling\Task;
 use Kode\Scheduling\TaskOutcome;
+use Kode\Scheduling\TaskStatus;
 use PHPUnit\Framework\TestCase;
 
 /**
- * 验证分布式框架抽象层：TaskOutcome / Runner / Mutex / Coordinator，
- * 以及 Scheduler 对可替换组件的接入。外部包（kode/*）缺失时适配器应给出明确报错。
+ * 验证框架抽象层与新增能力：TaskOutcome / Runner / Mutex / Coordinator 接入，
+ * 以及标签筛选、成功/失败回调、启用开关、日志器注入。本库完全自包含，
+ * 不依赖任何外部调度/并发包。
  */
 final class FrameworkTest extends TestCase
 {
     public function test_task_outcome_states(): void
     {
-        self::assertTrue((new TaskOutcome('a', TaskOutcome::SUCCESS, 1))->succeeded());
-        self::assertTrue((new TaskOutcome('a', TaskOutcome::SKIPPED, skipReason: 'overlap'))->skipped());
-        self::assertTrue((new TaskOutcome('a', TaskOutcome::ERROR, error: new \RuntimeException('x')))->failed());
+        self::assertTrue((new TaskOutcome('a', TaskStatus::Success, 1))->succeeded());
+        self::assertTrue((new TaskOutcome('a', TaskStatus::Skipped, skipReason: 'overlap'))->skipped());
+        self::assertTrue((new TaskOutcome('a', TaskStatus::Error, error: new \RuntimeException('x')))->failed());
     }
 
     public function test_sync_runner_runs_due_tasks(): void
@@ -102,10 +101,12 @@ final class FrameworkTest extends TestCase
         $scheduler->call('a', static fn () => 'ran')->cron('* * * * *');
 
         $blocked = new class () implements CoordinatorInterface {
+            #[\Override]
             public function tick(): void
             {
             }
 
+            #[\Override]
             public function shouldDispatch(): bool
             {
                 return false;
@@ -127,6 +128,7 @@ final class FrameworkTest extends TestCase
             ) {
             }
 
+            #[\Override]
             public function runAll(array $tasks, \DateTimeImmutable $now): array
             {
                 foreach ($tasks as $t) {
@@ -134,7 +136,7 @@ final class FrameworkTest extends TestCase
                 }
 
                 return \array_map(
-                    static fn (Task $t): TaskOutcome => new TaskOutcome($t->name(), TaskOutcome::SUCCESS, 'ok'),
+                    static fn (Task $t): TaskOutcome => new TaskOutcome($t->name(), TaskStatus::Success, 'ok'),
                     $tasks
                 );
             }
@@ -149,47 +151,104 @@ final class FrameworkTest extends TestCase
         self::assertSame(1, $report->succeededCount());
     }
 
-    public function test_fibers_runner_throws_without_package(): void
+    public function test_run_by_tag_filters_tasks(): void
     {
-        if (\class_exists(\Kode\Fibers\Core\FiberPool::class)) {
-            self::markTestSkipped('kode/fibers 已安装');
+        $ran = [];
+        $sch = new Scheduler();
+        $sch->call('backup', static function () use (&$ran) { $ran[] = 'backup'; })
+            ->cron('* * * * *')->tag('db');
+        $sch->call('report', static function () use (&$ran) { $ran[] = 'report'; })
+            ->cron('* * * * *')->tag('daily');
 
-            return;
-        }
-        $this->expectException(SchedulingError::class);
-        new FibersRunner();
+        $report = $sch->run(new \DateTimeImmutable('2026-08-12 10:00:00'), 'db');
+        self::assertSame(['backup'], $ran);
+        self::assertSame(1, $report->succeededCount());
     }
 
-    public function test_parallel_runner_throws_without_package(): void
+    public function test_disabled_task_is_skipped(): void
     {
-        if (\class_exists(\Kode\Parallel\Pool\WorkerPool::class)) {
-            self::markTestSkipped('kode/parallel 已安装');
+        $ran = [];
+        $sch = new Scheduler();
+        $sch->call('off', static function () use (&$ran) { $ran[] = 'off'; })
+            ->cron('* * * * *')->enabled(false);
 
-            return;
-        }
-        $this->expectException(SchedulingError::class);
-        new ParallelRunner();
+        $report = $sch->run(new \DateTimeImmutable('2026-08-12 10:00:00'));
+        self::assertSame([], $ran);
+        self::assertSame(0, $report->succeededCount());
     }
 
-    public function test_process_mutex_throws_without_package(): void
+    public function test_on_success_and_on_failure_callbacks(): void
     {
-        if (\class_exists(\Kode\Process\Cluster::class)) {
-            self::markTestSkipped('kode/process 已安装');
+        $successHit = false;
+        $failureHit = '';
+        $sch = new Scheduler();
+        $sch->call('ok', static fn () => 'res')
+            ->cron('* * * * *')
+            ->onSuccess(static function ($r) use (&$successHit) { $successHit = $r; });
+        $sch->call('bad', static function (): void { throw new \RuntimeException('nope'); })
+            ->cron('* * * * *')
+            ->onFailure(static function ($e) use (&$failureHit) { $failureHit = $e->getMessage(); });
 
-            return;
-        }
-        $this->expectException(SchedulingError::class);
-        new \Kode\Scheduling\Mutex\ProcessMutex();
+        $sch->run(new \DateTimeImmutable('2026-08-12 10:00:00'));
+        self::assertSame('res', $successHit);
+        self::assertSame('nope', $failureHit);
     }
 
-    public function test_leader_coordinator_throws_without_package(): void
+    public function test_logger_is_invoked_on_run(): void
     {
-        if (\class_exists(\Kode\Process\Cluster::class)) {
-            self::markTestSkipped('kode/process 已安装');
+        $lines = [];
+        $logger = new class ($lines) implements \Kode\Scheduling\LoggerInterface {
+            public function __construct(public array &$lines)
+            {
+            }
 
-            return;
-        }
-        $this->expectException(SchedulingError::class);
-        new \Kode\Scheduling\Coordinator\LeaderCoordinator();
+            #[\Override]
+            public function debug(string $message, array $context = []): void
+            {
+                $this->lines[] = "DEBUG $message";
+            }
+
+            #[\Override]
+            public function info(string $message, array $context = []): void
+            {
+                $this->lines[] = "INFO $message";
+            }
+
+            #[\Override]
+            public function warning(string $message, array $context = []): void
+            {
+                $this->lines[] = "WARN $message";
+            }
+
+            #[\Override]
+            public function error(string $message, array $context = []): void
+            {
+                $this->lines[] = "ERROR $message";
+            }
+        };
+
+        $sch = new Scheduler();
+        $sch->call('a', static fn () => 1)->cron('* * * * *');
+        $sch->setLogger($logger);
+
+        $sch->run(new \DateTimeImmutable('2026-08-12 10:00:00'));
+
+        self::assertContains('INFO 调度开始', $lines);
+        self::assertContains('INFO 任务成功', $lines);
+        self::assertContains('INFO 调度结束', $lines);
+    }
+
+    public function test_every_second_produces_six_field(): void
+    {
+        $task = (new Scheduler())->call('s', static fn () => 1)->everySecond();
+        self::assertSame('*/1 * * * * *', $task->expression());
+        self::assertTrue($task->hasSeconds());
+
+        $task2 = (new Scheduler())->call('s2', static fn () => 1)->everySeconds(10);
+        self::assertSame('*/10 * * * * *', $task2->expression());
+
+        $task3 = (new Scheduler())->call('s3', static fn () => 1)->dailyAt('03:30')->second(15);
+        self::assertSame('15 30 3 * * *', $task3->expression());
+        self::assertTrue($task3->hasSeconds());
     }
 }

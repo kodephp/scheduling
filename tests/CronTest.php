@@ -80,4 +80,50 @@ final class CronTest extends TestCase
         self::assertStringContainsString('工作日', (new Cron('0 9 * * 1-5'))->describe());
         self::assertSame('每月 1 号，00:00', (new Cron('0 0 1 * *'))->describe());
     }
+
+    public function test_six_field_seconds_is_due(): void
+    {
+        // 6 段：秒 分 时 日 月 周
+        $c = new Cron('30 0 12 * * *'); // 每天 12:00:30
+        self::assertTrue($c->isDue(new \DateTimeImmutable('2026-08-12 12:00:30')));
+        self::assertFalse($c->isDue(new \DateTimeImmutable('2026-08-12 12:00:31')));
+        self::assertFalse($c->isDue(new \DateTimeImmutable('2026-08-12 12:00:00')));
+        self::assertTrue($c->hasSeconds());
+    }
+
+    public function test_six_field_every_seconds(): void
+    {
+        $c = new Cron('*/15 * * * * *'); // 每 15 秒
+        self::assertTrue($c->isDue(new \DateTimeImmutable('2026-08-12 10:00:15')));
+        self::assertTrue($c->isDue(new \DateTimeImmutable('2026-08-12 10:00:45')));
+        self::assertFalse($c->isDue(new \DateTimeImmutable('2026-08-12 10:00:10')));
+    }
+
+    public function test_six_field_next_run_steps_by_second(): void
+    {
+        // 每秒触发：nextRun 必须严格晚于 $from 且步长为秒
+        $now = new \DateTimeImmutable('2026-08-12 10:00:00');
+        $next = (new Cron('*/1 * * * * *'))->nextRun($now);
+        self::assertSame('2026-08-12 10:00:01', $next->format('Y-m-d H:i:s'));
+    }
+
+    public function test_five_field_has_no_seconds(): void
+    {
+        $c = new Cron('30 3 * * *');
+        self::assertFalse($c->hasSeconds());
+        // 5 段表达式不校验秒，任意秒都命中
+        self::assertTrue($c->isDue(new \DateTimeImmutable('2026-08-12 03:30:47')));
+    }
+
+    public function test_invalid_six_field_throws(): void
+    {
+        $this->expectException(CronExpressionError::class);
+        new Cron('* * * * * * *'); // 7 段非法
+    }
+
+    public function test_describe_includes_seconds(): void
+    {
+        self::assertStringContainsString('每 30 秒', (new Cron('*/30 * * * * *'))->describe());
+        self::assertStringContainsString('第 0 秒', (new Cron('0 * * * * *'))->describe());
+    }
 }

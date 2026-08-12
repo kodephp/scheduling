@@ -4,12 +4,12 @@
 declare(strict_types=1);
 
 /**
- * kode/scheduling 命令行入口。
+ * kode/scheduling 命令行入口（完全自包含，无外部依赖）。
  *
  * 用法：
- *   scheduler run  [--schedule=文件] [--env=环境] [--tz=时区]   执行到期任务
- *   scheduler list [--schedule=文件] [--tz=时区]                列出全部任务
- *   scheduler next [--schedule=文件] [--tz=时区]                显示各任务下次运行时刻
+ *   scheduler run  [--schedule=文件] [--env=环境] [--tz=时区] [--tag=标签] [--verbose]   执行到期任务
+ *   scheduler list [--schedule=文件] [--tz=时区] [--tag=标签]                             列出全部任务
+ *   scheduler next [--schedule=文件] [--tz=时区]                                          显示各任务下次运行时刻
  *
  * schedule 文件约定：返回一个 Kode\Scheduling\Scheduler 实例，例如
  *   <?php
@@ -27,10 +27,7 @@ foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php
     }
 }
 
-use Kode\Scheduling\Coordinator\LeaderCoordinator;
-use Kode\Scheduling\Mutex\ProcessMutex;
-use Kode\Scheduling\Runner\FibersRunner;
-use Kode\Scheduling\Runner\ParallelRunner;
+use Kode\Scheduling\Logger\SimpleLogger;
 use Kode\Scheduling\Scheduler;
 
 /** 解析命令行参数。 */
@@ -41,12 +38,8 @@ function parse_args(array $argv): array
         'schedule' => \getcwd() . \DIRECTORY_SEPARATOR . 'schedule.php',
         'env' => '',
         'tz' => '',
-        'runner' => 'sync',     // sync | fibers | parallel
-        'distributed' => false,  // 启用 kode/process 的分布式锁 + Leader 选举
-        'backend' => '',         // 分布式存储后端：redis / file / globaldata
-        'concurrency' => '0',
-        'engine' => '',          // parallel 引擎：parallel | process
-        'bootstrap' => '',       // parallel 进程引擎引导文件
+        'tag' => '',
+        'verbose' => false,
     ];
     for ($i = 2; $i < \count($argv); $i++) {
         if (\str_starts_with($argv[$i], '--')) {
@@ -95,58 +88,25 @@ if ($options['tz'] !== '') {
 if ($options['env'] !== '') {
     $scheduler->environment($options['env']);
 }
-
-// 分布式模式：启用 kode/process 的分布式锁 + Leader 选举（需先 composer require kode/process）
-if ($options['distributed'] !== false) {
-    if (\class_exists(\Kode\Process\Cluster::class) === false) {
-        \fwrite(\STDERR, "分布式模式需要 kode/process：composer require kode/process\n");
-        exit(1);
-    }
-    if ($options['backend'] !== '') {
-        \Kode\Process\Cluster::make($options['backend'], []);
-    }
-    $scheduler->setMutex(new ProcessMutex());
-    $scheduler->setCoordinator(new LeaderCoordinator());
-    echo "[分布式] 已启用 ProcessMutex + LeaderCoordinator（后端：{$options['backend']}）\n";
-}
-
-// 执行器：sync（默认）/ fibers / parallel
-$runnerName = \is_string($options['runner']) ? $options['runner'] : 'sync';
-if ($runnerName === 'fibers') {
-    try {
-        $scheduler->setRunner(new FibersRunner());
-    } catch (\Kode\Scheduling\Exception\SchedulingError $e) {
-        \fwrite(\STDERR, $e->getMessage() . "\n");
-        exit(1);
-    }
-    echo "[执行器] FibersRunner（kode/fibers 协程池）\n";
-} elseif ($runnerName === 'parallel') {
-    try {
-        $engine = $options['engine'] === '' ? null : (string) $options['engine'];
-        $bootstrap = $options['bootstrap'] === '' ? null : (string) $options['bootstrap'];
-        $scheduler->setRunner(new ParallelRunner((int) $options['concurrency'], $engine, $bootstrap));
-    } catch (\Kode\Scheduling\Exception\SchedulingError $e) {
-        \fwrite(\STDERR, $e->getMessage() . "\n");
-        exit(1);
-    }
-    $conc = (int) $options['concurrency'];
-    echo "[执行器] ParallelRunner（kode/parallel，并发={$conc}，引擎={$engine}）\n";
+if ($options['verbose'] !== false) {
+    $scheduler->setLogger(new SimpleLogger());
 }
 
 $now = new \DateTimeImmutable('now', new \DateTimeZone(\date_default_timezone_get()));
+$tags = $options['tag'] === '' ? [] : \explode(',', (string) $options['tag']);
 
 match ($command) {
-    'run' => run_command($scheduler, $now),
-    'list' => list_command($scheduler, $now),
+    'run' => run_command($scheduler, $now, $tags),
+    'list' => list_command($scheduler, $now, $tags),
     'next' => next_command($scheduler, $now),
 };
 
 /**
  * 执行到期任务并打印报告。
  */
-function run_command(Scheduler $scheduler, \DateTimeImmutable $now): void
+function run_command(Scheduler $scheduler, \DateTimeImmutable $now, array $tags): void
 {
-    $report = $scheduler->run($now);
+    $report = $scheduler->run($now, $tags);
     echo \sprintf(
         "运行完成 @ %s | 成功 %d | 失败 %d | 跳过 %d\n",
         $report->ranAt()->format('Y-m-d H:i:s'),
@@ -166,21 +126,27 @@ function run_command(Scheduler $scheduler, \DateTimeImmutable $now): void
 /**
  * 列出全部任务及其表达式/描述。
  */
-function list_command(Scheduler $scheduler, \DateTimeImmutable $now): void
+function list_command(Scheduler $scheduler, \DateTimeImmutable $now, array $tags): void
 {
-    $tasks = $scheduler->tasks();
+    $tasks = $tags === [] ? $scheduler->tasks() : \array_filter(
+        $scheduler->tasks(),
+        static fn ($t) => \count(\array_intersect($tags, $t->tags())) > 0
+    );
     if ($tasks === []) {
         echo "（暂无任务）\n";
         return;
     }
     foreach ($tasks as $task) {
         $desc = $task->getDescription();
+        $tagStr = $task->tags() === [] ? '' : (' #' . \implode(' #', $task->tags()));
         echo \sprintf(
-            "- %s | %s | %s%s\n",
+            "- %s | %s | %s%s%s%s\n",
             $task->name(),
             $task->expression(),
-            $task->nextRun($now)?->format('Y-m-d H:i') ?? 'n/a',
-            $desc !== null ? " | {$desc}" : ''
+            $task->nextRun($now)?->format('Y-m-d H:i:s') ?? 'n/a',
+            $desc !== null ? " | {$desc}" : '',
+            $tagStr,
+            $task->isEnabled() ? '' : ' [已停用]'
         );
     }
 }

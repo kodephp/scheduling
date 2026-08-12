@@ -8,10 +8,12 @@ namespace Kode\Scheduling\Contract;
  * 互斥锁契约（用于防重入 / 防重叠执行）。
  *
  * withoutOverlapping() 依赖它保证“同一任务同一时刻只有一个执行单元在跑”。
- * 通过替换实现，可在单节点与分布式集群间无缝切换：
+ * 通过替换实现，可适配不同的互斥后端（本机文件锁、Redis、数据库行锁等）：
  *
- *  - FileMutex    ：默认，基于本地文件锁（flock），仅对“同一台机器”有效；
- *  - ProcessMutex  ：基于 kode/process 的分布式锁，跨节点互斥（需共享存储后端）。
+ *  - FileMutex：默认，基于本地文件锁（flock），仅对“同一台机器”有效。
+ *
+ * 框架完全自包含；如需跨节点互斥，自行实现一个基于共享存储（如 Redis）
+ * 的 MutexInterface 并 setMutex() 即可，不绑定任何特定外部包。
  *
  * 约定：acquire() 成功返回 true 并持有锁直到显式 release()；同进程内可重入由实现自行决定。
  */

@@ -20,21 +20,18 @@ use Kode\Scheduling\Mutex\FileMutex;
  *
  * 设计要点：
  *  - 时区：cron 字段始终按任务自身时区解释；
+ *  - 精度：支持分钟级（5 段）与秒级（6 段，Quartz 风格）两种表达式；
  *  - 防重叠：可开启文件锁，避免同一任务并发重入；
  *  - 条件执行：when()/skipWhen() 在运行时决定是否真正执行；
- *  - 生命周期钩子：before()/after() 分别在执行前后触发。
+ *  - 生命周期钩子：before()/after()/onSuccess()/onFailure() 分别在执行前后触发。
  */
 final class Task
 {
-    /** 5 段 cron 字段的索引：0=分 1=时 2=日 3=月 4=周。 */
-    private const MINUTE = 0;
-    private const HOUR = 1;
-    private const DAY = 2;
-    private const MONTH = 3;
-    private const WEEKDAY = 4;
-
-    /** 当前 cron 字段（5 段），用于流畅地组合时间限制。 */
+    /** 当前 cron 字段：5 段（分钟级）或 6 段（秒级）。 */
     private array $segments = ['*', '*', '*', '*', '*'];
+
+    /** 是否包含“秒”字段（6 段）。分钟级工具方法会将其重置为 false。 */
+    private bool $hasSeconds = false;
 
     /** 由 segments 构建的 Cron 对象缓存（字段变更后失效重建）。 */
     private ?Cron $cron = null;
@@ -93,6 +90,18 @@ final class Task
     /** 重试间隔（毫秒）。 */
     private int $retryDelayMs = 0;
 
+    /** 标签：用于按标签批量运行（如 run(tag: 'backup')）。 */
+    private array $tags = [];
+
+    /** 是否启用；false 时永远不参与调度（便于临时停用）。 */
+    private bool $enabled = true;
+
+    /** 成功回调（执行成功且重试后仍成功时触发）。 */
+    private array $onSuccesses = [];
+
+    /** 失败回调（重试耗尽后仍失败时触发，参数为异常）。 */
+    private array $onFailures = [];
+
     /**
      * @param string   $name     任务唯一名称（用于锁、日志、报告）
      * @param callable $callback 任意可调用对象；执行时会把本 Task 实例作为首参传入
@@ -122,13 +131,18 @@ final class Task
     // 频率配置（流畅方法，均返回 $this）
     // ------------------------------------------------------------------
 
-    /** 使用原始 5 段 cron 表达式（或 @宏）。 */
+    /** 使用原始 5 段或 6 段 cron 表达式（或 @宏）。 */
     public function cron(string $expression): static
     {
         $parts = \preg_split('/\s+/', \trim($expression));
-        if ($parts === false || \count($parts) !== 5) {
-            throw TaskError::for($this->name, 'cron() 需传入 5 段表达式（分 时 日 月 周）');
+        $n = $parts === false ? 0 : \count($parts);
+        if ($n !== 5 && $n !== 6) {
+            throw TaskError::for(
+                $this->name,
+                'cron() 需传入 5 段表达式（分 时 日 月 周）或 6 段表达式（秒 分 时 日 月 周）'
+            );
         }
+        $this->hasSeconds = ($n === 6);
         $this->segments = $parts;
         $this->cron = null;
 
@@ -177,25 +191,59 @@ final class Task
         return $this->cron(\sprintf('%d * * * *', $minute));
     }
 
+    /** 每秒（秒级：每 1 秒触发一次，等价于 6 段表达式 "星号除1 ..."）。 */
+    public function everySecond(): static
+    {
+        return $this->cron('*/1 * * * * *');
+    }
+
+    /** 每 $n 秒（秒级）。 */
+    public function everySeconds(int $n): static
+    {
+        if ($n < 1 || $n > 59) {
+            throw TaskError::for($this->name, 'everySeconds() 的间隔需为 1-59 秒');
+        }
+
+        return $this->cron(\sprintf('*/%d * * * * *', $n));
+    }
+
+    /** 显式指定“秒”字段（自动将表达式升级为 6 段秒级）。 */
+    public function second(int $second): static
+    {
+        if ($second < 0 || $second > 59) {
+            throw TaskError::for($this->name, 'second() 需为 0-59');
+        }
+        if (!$this->hasSeconds) {
+            $this->segments = \array_merge(['*'], $this->segments);
+            $this->hasSeconds = true;
+        }
+        $this->segments[0] = (string) $second;
+        $this->cron = null;
+
+        return $this;
+    }
+
     /** 每天零点。 */
     public function daily(): static
     {
         return $this->cron('0 0 * * *');
     }
 
-    /** 每天指定时刻，如 dailyAt('03:30')。 */
+    /** 每天指定时刻，如 dailyAt('03:30')（分钟级，重置为 5 段）。 */
     public function dailyAt(string $time): static
     {
+        $this->resetToMinutePrecision();
         [$m, $h] = $this->parseTime($time);
-        $this->setSegment(self::MINUTE, $m);
-        $this->setSegment(self::HOUR, $h);
+        $this->setSegment($this->idxMinute(), $m);
+        $this->setSegment($this->idxHour(), $h);
 
         return $this;
     }
 
-    /** 每天多个指定时刻，如 at('01:00', '13:30')。 */
+    /** 每天多个指定时刻，如 at('01:00', '13:30')（分钟级，重置为 5 段）。 */
     public function at(string ...$times): static
     {
+        $this->resetToMinutePrecision();
         $minutes = [];
         $hours = [];
         foreach ($times as $time) {
@@ -203,17 +251,18 @@ final class Task
             $minutes[] = $m;
             $hours[] = $h;
         }
-        $this->setSegment(self::MINUTE, \implode(',', \array_unique($minutes)));
-        $this->setSegment(self::HOUR, \implode(',', \array_unique($hours)));
+        $this->setSegment($this->idxMinute(), \implode(',', \array_unique($minutes)));
+        $this->setSegment($this->idxHour(), \implode(',', \array_unique($hours)));
 
         return $this;
     }
 
-    /** 每天两次（默认 01:00 与 13:00）。 */
+    /** 每天两次（默认 01:00 与 13:00）（分钟级，重置为 5 段）。 */
     public function twiceDaily(int $hour1 = 1, int $hour2 = 13): static
     {
-        $this->setSegment(self::MINUTE, '0');
-        $this->setSegment(self::HOUR, \sprintf('%d,%d', $hour1, $hour2));
+        $this->resetToMinutePrecision();
+        $this->setSegment($this->idxMinute(), '0');
+        $this->setSegment($this->idxHour(), \sprintf('%d,%d', $hour1, $hour2));
 
         return $this;
     }
@@ -245,55 +294,55 @@ final class Task
     /** 工作日（周一至周五）执行，保留当前时分设置。 */
     public function weekdays(): static
     {
-        return $this->setSegment(self::WEEKDAY, '1-5');
+        return $this->setSegment($this->idxWeekday(), '1-5');
     }
 
     /** 周末（周六、周日）执行。 */
     public function weekends(): static
     {
-        return $this->setSegment(self::WEEKDAY, '0,6');
+        return $this->setSegment($this->idxWeekday(), '0,6');
     }
 
     /** 周一执行。 */
     public function mondays(): static
     {
-        return $this->setSegment(self::WEEKDAY, '1');
+        return $this->setSegment($this->idxWeekday(), '1');
     }
 
     /** 周二执行。 */
     public function tuesdays(): static
     {
-        return $this->setSegment(self::WEEKDAY, '2');
+        return $this->setSegment($this->idxWeekday(), '2');
     }
 
     /** 周三执行。 */
     public function wednesdays(): static
     {
-        return $this->setSegment(self::WEEKDAY, '3');
+        return $this->setSegment($this->idxWeekday(), '3');
     }
 
     /** 周四执行。 */
     public function thursdays(): static
     {
-        return $this->setSegment(self::WEEKDAY, '4');
+        return $this->setSegment($this->idxWeekday(), '4');
     }
 
     /** 周五执行。 */
     public function fridays(): static
     {
-        return $this->setSegment(self::WEEKDAY, '5');
+        return $this->setSegment($this->idxWeekday(), '5');
     }
 
     /** 周六执行。 */
     public function saturdays(): static
     {
-        return $this->setSegment(self::WEEKDAY, '6');
+        return $this->setSegment($this->idxWeekday(), '6');
     }
 
     /** 周日执行。 */
     public function sundays(): static
     {
-        return $this->setSegment(self::WEEKDAY, '0');
+        return $this->setSegment($this->idxWeekday(), '0');
     }
 
     // ------------------------------------------------------------------
@@ -426,6 +475,40 @@ final class Task
         return $this;
     }
 
+    /** 打标签（可多次调用累加），便于按标签运行或分组管理。 */
+    public function tag(string|array $tags): static
+    {
+        foreach ((array) $tags as $t) {
+            $this->tags[] = $t;
+        }
+
+        return $this;
+    }
+
+    /** 启用/停用本任务（停用后永远不参与调度）。 */
+    public function enabled(bool $enabled = true): static
+    {
+        $this->enabled = $enabled;
+
+        return $this;
+    }
+
+    /** 注册“成功回调”：任务执行成功（含重试后成功）后触发，参数为返回值。 */
+    public function onSuccess(callable $callback): static
+    {
+        $this->onSuccesses[] = $callback;
+
+        return $this;
+    }
+
+    /** 注册“失败回调”：重试耗尽仍失败时触发，参数为异常。 */
+    public function onFailure(callable $callback): static
+    {
+        $this->onFailures[] = $callback;
+
+        return $this;
+    }
+
     // ------------------------------------------------------------------
     // 判定与执行
     // ------------------------------------------------------------------
@@ -461,6 +544,9 @@ final class Task
      */
     public function shouldRun(\DateTimeImmutable $now, string $environment = ''): bool
     {
+        if (!$this->enabled) {
+            return false;
+        }
         if (!$this->isDue($now)) {
             return false;
         }
@@ -515,11 +601,25 @@ final class Task
             $this->lastResult = $result;
             $this->lastError = null;
             $this->lastSuccess = true;
+            foreach ($this->onSuccesses as $cb) {
+                try {
+                    $cb($result, $this);
+                } catch (\Throwable) {
+                    // 回调异常不应影响主流程
+                }
+            }
 
             return $result;
         } catch (\Throwable $e) {
             $this->lastError = $e;
             $this->lastSuccess = false;
+            foreach ($this->onFailures as $cb) {
+                try {
+                    $cb($e, $this);
+                } catch (\Throwable) {
+                    // 回调异常不应影响主流程
+                }
+            }
             throw $e;
         } finally {
             foreach ($this->afters as $cb) {
@@ -571,6 +671,24 @@ final class Task
         return $this->description;
     }
 
+    /** 是否包含秒字段（6 段）。 */
+    public function hasSeconds(): bool
+    {
+        return $this->hasSeconds;
+    }
+
+    /** 任务标签列表。 */
+    public function tags(): array
+    {
+        return $this->tags;
+    }
+
+    /** 是否处于启用状态。 */
+    public function isEnabled(): bool
+    {
+        return $this->enabled;
+    }
+
     // ------------------------------------------------------------------
     // 内部工具
     // ------------------------------------------------------------------
@@ -583,6 +701,42 @@ final class Task
         }
 
         return $this->cron;
+    }
+
+    /**
+     * 各字段在 segments 数组中的下标（随是否含“秒”字段而整体偏移）。
+     * 6 段（秒 分 时 日 月 周）时秒占 0 号位，其余顺延一位。
+     */
+    private function idxMinute(): int
+    {
+        return $this->hasSeconds ? 1 : 0;
+    }
+
+    private function idxHour(): int
+    {
+        return $this->hasSeconds ? 2 : 1;
+    }
+
+    private function idxDay(): int
+    {
+        return $this->hasSeconds ? 3 : 2;
+    }
+
+    private function idxMonth(): int
+    {
+        return $this->hasSeconds ? 4 : 3;
+    }
+
+    private function idxWeekday(): int
+    {
+        return $this->hasSeconds ? 5 : 4;
+    }
+
+    /** 将表达式重置为分钟级（5 段），供 dailyAt/at/twiceDaily 等工具方法使用。 */
+    private function resetToMinutePrecision(): void
+    {
+        $this->hasSeconds = false;
+        $this->segments = ['*', '*', '*', '*', '*'];
     }
 
     /** 仅修改单段字段，并令 Cron 缓存失效（用于 weekdays() 等组合方法）。 */

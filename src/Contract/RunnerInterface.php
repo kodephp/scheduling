@@ -13,9 +13,10 @@ use Kode\Scheduling\TaskOutcome;
  * 调度器把“已判定为到期且应执行”的任务交给 Runner 真正跑起来。
  * 通过替换 Runner，框架可在不改动业务代码的前提下切换执行模型：
  *
- *  - SyncRunner    ：默认，单进程顺序执行（最稳，调试友好）；
- *  - FibersRunner  ：基于 kode/fibers 的协程池并发执行（I/O 密集型友好）；
- *  - ParallelRunner：基于 kode/parallel 的多线程/多进程池执行（CPU 密集型友好）。
+ *  - SyncRunner：默认，单进程顺序执行（最稳，调试友好）。
+ *
+ * 框架完全自包含，不依赖任何外部调度/并发包；如需自定义并发模型
+ * （如基于 PHP 原生 Fiber 或并行扩展），实现本接口并 setRunner() 即可。
  *
  * runAll() 必须返回与入参顺序一致的 TaskOutcome 列表，且“单任务失败不得中断其余任务”。
  */

@@ -11,7 +11,8 @@ use Kode\Scheduling\Lock;
  * 默认互斥锁：基于本地文件锁（flock）。
  *
  * 仅对“同一台机器”有效——同一主机上的多个进程/多个 Scheduler 实例
- * 不会同时跑同一任务；但不同机器之间无感知。分布式场景请改用 ProcessMutex。
+ * 不会同时跑同一任务；但不同机器之间无感知。跨节点互斥请自行实现
+ * MutexInterface（如基于 Redis）后通过 setMutex() 替换。
  *
  * 逻辑锁名会被安全地映射为临时目录下的一个锁文件，因此调用方可以放心使用
  * 任意字符串作为 key（如 "kode:scheduling:overlap:order-sync"）。
@@ -26,6 +27,7 @@ final class FileMutex implements MutexInterface
     ) {
     }
 
+    #[\Override]
     public function acquire(string $key, float $ttlSeconds): bool
     {
         $path = $this->pathFor($key);
@@ -39,6 +41,7 @@ final class FileMutex implements MutexInterface
         return false;
     }
 
+    #[\Override]
     public function release(string $key): void
     {
         if (isset($this->held[$key])) {

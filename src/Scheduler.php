@@ -9,6 +9,8 @@ use Kode\Scheduling\Contract\MutexInterface;
 use Kode\Scheduling\Contract\RunnerInterface;
 use Kode\Scheduling\Coordinator\LocalCoordinator;
 use Kode\Scheduling\Exception\TaskError;
+use Kode\Scheduling\Logger\NullLogger;
+use Kode\Scheduling\LoggerInterface;
 use Kode\Scheduling\Mutex\FileMutex;
 use Kode\Scheduling\Runner\SyncRunner;
 
@@ -64,12 +66,16 @@ final class Scheduler
     /** 协调器：决定“本节点是否应当派发”（单机/集群 Leader）。 */
     private ?CoordinatorInterface $coordinator = null;
 
+    /** 运行期日志器（默认 NullLogger，不产生任何输出）。 */
+    private LoggerInterface $logger;
+
     /**
      * @param \DateTimeZone|null $timezone 调度器基准时区（用于解析“现在”）
      */
     public function __construct(?\DateTimeZone $timezone = null)
     {
         $this->timezone = $timezone ?? new \DateTimeZone(\date_default_timezone_get());
+        $this->logger = new NullLogger();
     }
 
     /** 设定调度器基准时区。 */
@@ -144,6 +150,14 @@ final class Scheduler
     public function setCoordinator(CoordinatorInterface $coordinator): static
     {
         $this->coordinator = $coordinator;
+
+        return $this;
+    }
+
+    /** 设置日志器（默认 NullLogger，不产生任何输出）。可用 SimpleLogger 或任意 PSR-3 适配器。 */
+    public function setLogger(LoggerInterface $logger): static
+    {
+        $this->logger = $logger;
 
         return $this;
     }
@@ -228,11 +242,15 @@ final class Scheduler
         return null;
     }
 
-    /** 返回在 $now 到期且应执行的任务（尚未真正运行）。 */
-    public function dueTasks(\DateTimeImmutable $now): array
+    /** 返回在 $now 到期且应执行的任务（尚未真正运行）。可按标签过滤。 */
+    public function dueTasks(\DateTimeImmutable $now, string|array $tags = []): array
     {
+        $tags = (array) $tags;
         $due = [];
         foreach ($this->tasks as $task) {
+            if ($tags !== [] && !$this->taskHasAnyTag($task, $tags)) {
+                continue;
+            }
             if ($task->shouldRun($now, $this->environment)) {
                 $due[] = $task;
             }
@@ -244,12 +262,16 @@ final class Scheduler
     /**
      * 执行所有到期任务。
      *
-     * @param \DateTimeImmutable|null $now 基准时刻；默认取当前时刻（调度器时区）
+     * @param \DateTimeImmutable|null $now  基准时刻；默认取当前时刻（调度器时区）
+     * @param string|array           $tags  仅运行带有这些标签的任务；为空表示全部
      */
-    public function run(?\DateTimeImmutable $now = null): RunReport
+    public function run(?\DateTimeImmutable $now = null, string|array $tags = []): RunReport
     {
         $now = $now ?? new \DateTimeImmutable('now', $this->timezone);
+        $tags = (array) $tags;
         $report = new RunReport($now);
+
+        $this->logger->info('调度开始', ['at' => $now->format(\DateTimeInterface::ATOM), 'tags' => $tags]);
 
         foreach ($this->beforeRuns as $cb) {
             $cb($now);
@@ -259,6 +281,7 @@ final class Scheduler
         $this->coordinator()->tick();
         if (!$this->coordinator()->shouldDispatch()) {
             $report->setDispatched(false);
+            $this->logger->info('本节点非派发节点，本次空转');
             foreach ($this->afterRuns as $cb) {
                 $cb($report);
             }
@@ -269,26 +292,34 @@ final class Scheduler
         // 2) 收集到期且应执行的任务（环境/条件/时间窗口不满足的记为跳过）
         $runnable = [];
         foreach ($this->tasks as $task) {
+            if ($tags !== [] && !$this->taskHasAnyTag($task, $tags)) {
+                continue;
+            }
             if (!$task->isDue($now)) {
                 continue; // 未到期，直接跳过（不计入报告）
             }
             if (!$task->shouldRun($now, $this->environment)) {
                 $report->addSkipped($task->name(), 'condition');
+                $this->logger->debug('任务跳过（条件/环境/窗口/停用）', ['task' => $task->name()]);
 
                 continue;
             }
             $runnable[] = $task;
         }
 
-        // 3) 交给执行器批量执行（同步/协程/并行），单任务失败不影响其余
+        // 3) 交给执行器批量执行（默认同步；可替换为自定义 Runner），单任务失败不影响其余
         $outcomes = $this->runner()->runAll($runnable, $now);
         foreach ($outcomes as $outcome) {
             if ($outcome->succeeded()) {
                 $report->addSuccess($outcome->name, $outcome->result);
+                $this->logger->info('任务成功', ['task' => $outcome->name]);
             } elseif ($outcome->skipped()) {
-                $report->addSkipped($outcome->name, $outcome->skipReason ?? 'condition');
+                $reason = $outcome->skipReason ?? 'condition';
+                $report->addSkipped($outcome->name, $reason);
+                $this->logger->debug('任务由执行器跳过', ['task' => $outcome->name, 'reason' => $reason]);
             } else {
                 $report->addFailure($outcome->name, $outcome->error ?? TaskError::for($outcome->name, '未知执行错误'));
+                $this->logger->error('任务失败', ['task' => $outcome->name, 'error' => $outcome->error?->getMessage() ?? '']);
                 if ($this->errorHandler !== null) {
                     $failed = $this->find($outcome->name);
                     ($this->errorHandler)($failed ?? $outcome->name, $outcome->error);
@@ -298,6 +329,12 @@ final class Scheduler
                 }
             }
         }
+
+        $this->logger->info('调度结束', [
+            'success' => $report->succeededCount(),
+            'failed' => $report->failedCount(),
+            'skipped' => $report->skippedCount(),
+        ]);
 
         foreach ($this->afterRuns as $cb) {
             $cb($report);
@@ -312,12 +349,21 @@ final class Scheduler
      * 适合以常驻进程方式运行（配合 nohup/supervisor）。收到 SIGINT/SIGTERM
      * 时会优雅停止当前等待并退出（pcntl 扩展可用时生效）。
      *
-     * @param int $intervalSeconds 轮询间隔（秒），默认 60
+     * 若注册的任务中存在“秒级（6 段）”任务，守护循环会自动将轮询精度
+     * 提升到每秒一次，以保证秒级调度不被分钟级间隔错过。
+     *
+     * @param int $intervalSeconds 轮询间隔（秒），默认 60；秒级任务存在时自动降为 1
      */
     public function keepAlive(int $intervalSeconds = 60): void
     {
         if ($intervalSeconds < 1) {
             throw TaskError::for('__scheduler__', 'keepAlive 间隔必须 >= 1 秒');
+        }
+
+        // 存在秒级任务时，强制以秒为粒度轮询，否则会漏掉亚分钟触发点
+        if ($this->hasSecondPrecisionTasks()) {
+            $intervalSeconds = 1;
+            $this->logger->info('检测到秒级任务，守护循环精度提升为每秒一次');
         }
 
         if (\function_exists('pcntl_signal')) {
@@ -380,5 +426,29 @@ final class Scheduler
         }
 
         return \md5(\serialize($callback));
+    }
+
+    /** 任务是否带任一指定标签。 */
+    private function taskHasAnyTag(Task $task, array $tags): bool
+    {
+        foreach ($tags as $tag) {
+            if (\in_array($tag, $task->tags(), true)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** 是否存在“秒级（6 段）”任务——用于守护循环自动提升轮询精度。 */
+    private function hasSecondPrecisionTasks(): bool
+    {
+        foreach ($this->tasks as $task) {
+            if ($task->hasSeconds()) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }
