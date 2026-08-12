@@ -1,0 +1,40 @@
+{
+    "name": "kode/scheduling",
+    "description": "通用 Cron 调度器：支持任意 callable / task 的简洁健壮 PHP 定时任务库",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "cron",
+        "scheduler",
+        "schedule",
+        "task",
+        "timer",
+        "定时任务"
+    ],
+    "authors": [
+        {
+            "name": "Kode"
+        }
+    ],
+    "require": {
+        "php": ">=8.3"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Kode\\Scheduling\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Kode\\Scheduling\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

@@ -1,0 +1,28 @@
+# 依赖（库不锁定，由使用者自行 composer install）
+/vendor/
+composer.lock
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+.phpstorm.meta.php
+_ide_helper.php
+_ide_helper_models.php
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志 / 测试缓存
+*.log
+.phpunit.result.cache
+.phpunit.cache/
+.php-cs-fixer.cache
+
+# 内部工具内存（非包内容）
+.workbuddy/
