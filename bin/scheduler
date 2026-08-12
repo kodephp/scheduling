@@ -1,0 +1,150 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * kode/scheduling 命令行入口。
+ *
+ * 用法：
+ *   scheduler run  [--schedule=文件] [--env=环境] [--tz=时区]   执行到期任务
+ *   scheduler list [--schedule=文件] [--tz=时区]                列出全部任务
+ *   scheduler next [--schedule=文件] [--tz=时区]                显示各任务下次运行时刻
+ *
+ * schedule 文件约定：返回一个 Kode\Scheduling\Scheduler 实例，例如
+ *   <?php
+ *   use Kode\Scheduling\Scheduler;
+ *   $s = new Scheduler();
+ *   $s->call('备份', fn () => backup())->dailyAt('02:00');
+ *   return $s;
+ */
+
+// 健壮地定位 Composer 自动加载（仓库内或作为依赖安装均可）
+foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $autoload) {
+    if (\is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+use Kode\Scheduling\Scheduler;
+
+/** 解析命令行参数。 */
+function parse_args(array $argv): array
+{
+    $command = $argv[1] ?? 'run';
+    $options = ['schedule' => \getcwd() . \DIRECTORY_SEPARATOR . 'schedule.php', 'env' => '', 'tz' => ''];
+    for ($i = 2; $i < \count($argv); $i++) {
+        if (\str_starts_with($argv[$i], '--')) {
+            $kv = \substr($argv[$i], 2);
+            if (\str_contains($kv, '=')) {
+                [$k, $v] = \explode('=', $kv, 2);
+                $options[$k] = $v;
+            } else {
+                $options[$kv] = true;
+            }
+        }
+    }
+
+    return [$command, $options];
+}
+
+/** 载入 schedule 文件，得到 Scheduler 实例。 */
+function load_scheduler(string $file): Scheduler
+{
+    if (!\is_file($file)) {
+        \fwrite(\STDERR, "找不到 schedule 文件：$file\n");
+        exit(1);
+    }
+    $scheduler = require $file;
+    if ($scheduler instanceof Scheduler) {
+        return $scheduler;
+    }
+    if (isset($GLOBALS['scheduler']) && $GLOBALS['scheduler'] instanceof Scheduler) {
+        return $GLOBALS['scheduler'];
+    }
+    \fwrite(\STDERR, "schedule 文件必须 return 一个 Scheduler 实例（或在全局 \$scheduler 中赋值）\n");
+    exit(1);
+}
+
+[$command, $options] = parse_args($argv);
+
+if (!\in_array($command, ['run', 'list', 'next'], true)) {
+    \fwrite(\STDERR, "未知命令：$command（可用 run / list / next）\n");
+    exit(1);
+}
+
+$scheduler = load_scheduler($options['schedule']);
+if ($options['tz'] !== '') {
+    $scheduler->timezone($options['tz']);
+}
+if ($options['env'] !== '') {
+    $scheduler->environment($options['env']);
+}
+
+$now = new \DateTimeImmutable('now', new \DateTimeZone(\date_default_timezone_get()));
+
+match ($command) {
+    'run' => run_command($scheduler, $now),
+    'list' => list_command($scheduler, $now),
+    'next' => next_command($scheduler, $now),
+};
+
+/**
+ * 执行到期任务并打印报告。
+ */
+function run_command(Scheduler $scheduler, \DateTimeImmutable $now): void
+{
+    $report = $scheduler->run($now);
+    echo \sprintf(
+        "运行完成 @ %s | 成功 %d | 失败 %d | 跳过 %d\n",
+        $report->ranAt()->format('Y-m-d H:i:s'),
+        $report->succeededCount(),
+        $report->failedCount(),
+        $report->skippedCount()
+    );
+    foreach ($report->failures() as $name => $e) {
+        echo \sprintf("  [失败] %s : %s\n", $name, $e->getMessage());
+    }
+    foreach ($report->skipped() as $name => $reason) {
+        echo \sprintf("  [跳过] %s (%s)\n", $name, $reason);
+    }
+    exit($report->allSucceeded() ? 0 : 1);
+}
+
+/**
+ * 列出全部任务及其表达式/描述。
+ */
+function list_command(Scheduler $scheduler, \DateTimeImmutable $now): void
+{
+    $tasks = $scheduler->tasks();
+    if ($tasks === []) {
+        echo "（暂无任务）\n";
+        return;
+    }
+    foreach ($tasks as $task) {
+        $desc = $task->getDescription();
+        echo \sprintf(
+            "- %s | %s | %s%s\n",
+            $task->name(),
+            $task->expression(),
+            $task->nextRun($now)?->format('Y-m-d H:i') ?? 'n/a',
+            $desc !== null ? " | {$desc}" : ''
+        );
+    }
+}
+
+/**
+ * 显示各任务的下次运行时刻。
+ */
+function next_command(Scheduler $scheduler, \DateTimeImmutable $now): void
+{
+    foreach ($scheduler->tasks() as $task) {
+        $next = $task->nextRun($now);
+        echo \sprintf(
+            "%s 下次运行：%s\n",
+            $task->name(),
+            $next?->format('Y-m-d H:i:s') ?? '（未来无匹配）'
+        );
+    }
+}

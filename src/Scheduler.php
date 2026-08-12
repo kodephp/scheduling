@@ -40,6 +40,15 @@ final class Scheduler
     /** 遇错是否中断整个 run()。 */
     private bool $stopOnError = false;
 
+    /** 整轮运行开始前的钩子列表（参数为基准时刻 DateTimeImmutable）。 */
+    private array $beforeRuns = [];
+
+    /** 整轮运行结束后的钩子列表（参数为本次 RunReport）。 */
+    private array $afterRuns = [];
+
+    /** keepAlive 守护循环是否继续运行。 */
+    private bool $keepRunning = false;
+
     /**
      * @param \DateTimeZone|null $timezone 调度器基准时区（用于解析“现在”）
      */
@@ -76,6 +85,22 @@ final class Scheduler
     public function stopOnError(bool $stop = true): static
     {
         $this->stopOnError = $stop;
+
+        return $this;
+    }
+
+    /** 注册整轮运行开始前的钩子（回调接收基准时刻 DateTimeImmutable）。 */
+    public function beforeRun(callable $callback): static
+    {
+        $this->beforeRuns[] = $callback;
+
+        return $this;
+    }
+
+    /** 注册整轮运行结束后的钩子（回调接收本次 RunReport）。 */
+    public function afterRun(callable $callback): static
+    {
+        $this->afterRuns[] = $callback;
 
         return $this;
     }
@@ -165,6 +190,10 @@ final class Scheduler
         $now = $now ?? new \DateTimeImmutable('now', $this->timezone);
         $report = new RunReport($now);
 
+        foreach ($this->beforeRuns as $cb) {
+            $cb($now);
+        }
+
         foreach ($this->tasks as $task) {
             if (!$task->isDue($now)) {
                 continue; // 未到期，直接跳过
@@ -176,7 +205,7 @@ final class Scheduler
             }
 
             try {
-                $result = $task->run();
+                $result = $task->run($now);
                 if ($task->lastSkipReason() === 'overlap') {
                     $report->addSkipped($task->name(), 'overlap');
                 } else {
@@ -193,7 +222,51 @@ final class Scheduler
             }
         }
 
+        foreach ($this->afterRuns as $cb) {
+            $cb($report);
+        }
+
         return $report;
+    }
+
+    /**
+     * 守护模式：以 $intervalSeconds 为间隔循环执行，直到收到退出信号。
+     *
+     * 适合以常驻进程方式运行（配合 nohup/supervisor）。收到 SIGINT/SIGTERM
+     * 时会优雅停止当前等待并退出（pcntl 扩展可用时生效）。
+     *
+     * @param int $intervalSeconds 轮询间隔（秒），默认 60
+     */
+    public function keepAlive(int $intervalSeconds = 60): void
+    {
+        if ($intervalSeconds < 1) {
+            throw TaskError::for('__scheduler__', 'keepAlive 间隔必须 >= 1 秒');
+        }
+
+        if (\function_exists('pcntl_signal')) {
+            $stop = function (): void {
+                $this->keepRunning = false;
+            };
+            \pcntl_signal(\SIGINT, $stop);
+            \pcntl_signal(\SIGTERM, $stop);
+        }
+
+        $this->keepRunning = true;
+        while ($this->keepRunning) {
+            if (\function_exists('pcntl_signal_dispatch')) {
+                \pcntl_signal_dispatch();
+            }
+            $this->run();
+            // 分片睡眠，便于及时响应信号
+            $elapsed = 0;
+            while ($this->keepRunning && $elapsed < $intervalSeconds) {
+                \sleep(1);
+                $elapsed++;
+                if (\function_exists('pcntl_signal_dispatch')) {
+                    \pcntl_signal_dispatch();
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------

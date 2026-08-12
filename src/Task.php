@@ -69,6 +69,22 @@ final class Task
     /** 最近一次被跳过的原因：null=未跳过；'condition'=条件不满足；'overlap'=锁冲突。 */
     private ?string $lastSkipReason = null;
 
+    /** 任务可读描述（仅用于展示/日志，不影响调度）。 */
+    private ?string $description = null;
+
+    /** 执行时间窗口（H:i 格式）；为 null 表示不限制。 */
+    private ?string $windowStart = null;
+    private ?string $windowEnd = null;
+
+    /** 时间窗口语义：false=区间内执行；true=区间外执行（unlessBetween）。 */
+    private bool $unlessWindow = false;
+
+    /** 失败后重试次数（不含首次）。 */
+    private int $retryTimes = 0;
+
+    /** 重试间隔（毫秒）。 */
+    private int $retryDelayMs = 0;
+
     /**
      * @param string   $name     任务唯一名称（用于锁、日志、报告）
      * @param callable $callback 任意可调用对象；执行时会把本 Task 实例作为首参传入
@@ -335,6 +351,48 @@ final class Task
         return $this;
     }
 
+    /** 设置任务的可读描述（用于日志/展示）。 */
+    public function description(string $text): static
+    {
+        $this->description = $text;
+
+        return $this;
+    }
+
+    /** 限定仅在每日时间窗口 [from, to] 内执行（如 between('09:00', '18:00')）。 */
+    public function between(string $from, string $to): static
+    {
+        $this->windowStart = $this->normalizeHi($from);
+        $this->windowEnd = $this->normalizeHi($to);
+        $this->unlessWindow = false;
+
+        return $this;
+    }
+
+    /** 限定“仅不在”每日时间窗口 [from, to] 内执行（区间外才跑）。 */
+    public function unlessBetween(string $from, string $to): static
+    {
+        $this->between($from, $to);
+        $this->unlessWindow = true;
+
+        return $this;
+    }
+
+    /** 设置失败重试：最多重试 $times 次，每次间隔 $delayMs 毫秒。 */
+    public function retry(int $times, int $delayMs = 0): static
+    {
+        if ($times < 0) {
+            throw TaskError::for($this->name, 'retry() 次数不能为负');
+        }
+        if ($delayMs < 0) {
+            throw TaskError::for($this->name, 'retry() 间隔不能为负');
+        }
+        $this->retryTimes = $times;
+        $this->retryDelayMs = $delayMs;
+
+        return $this;
+    }
+
     // ------------------------------------------------------------------
     // 判定与执行
     // ------------------------------------------------------------------
@@ -364,7 +422,7 @@ final class Task
     }
 
     /**
-     * 综合判定：是否应当执行（到期 + 环境 + 条件）。
+     * 综合判定：是否应当执行（到期 + 环境 + 时间窗口 + 条件）。
      *
      * @param string $environment Scheduler 当前环境，用于 environments() 比对
      */
@@ -376,14 +434,26 @@ final class Task
         if ($this->environments !== [] && $environment !== '' && !\in_array($environment, $this->environments, true)) {
             return false;
         }
+        $taskNow = $this->timezone === null ? $now : $now->setTimezone($this->timezone);
+        if (!$this->inTimeWindow($taskNow)) {
+            return false;
+        }
 
         return $this->allowedByConditions();
     }
 
-    /** 执行任务。正常返回回调结果；被跳过（条件/锁）返回 null；回调抛错会向上抛出。 */
-    public function run(): mixed
+    /**
+     * 执行任务。
+     *
+     * @param \DateTimeImmutable|null $now 基准时刻（用于时间窗口判定与记录）；
+     *                                     为 null 时取当前时刻（任务时区）。
+     * @return mixed 正常返回回调结果；被跳过（条件/窗口/锁）返回 null；回调最终仍失败会向上抛出
+     */
+    public function run(?\DateTimeImmutable $now = null): mixed
     {
-        if (!$this->allowedByConditions()) {
+        $now ??= new \DateTimeImmutable('now', $this->timezone ?? new \DateTimeZone(\date_default_timezone_get()));
+
+        if (!$this->allowedByConditions() || !$this->inTimeWindow($now)) {
             $this->lastSkipReason = 'condition';
 
             return null;
@@ -404,9 +474,9 @@ final class Task
         }
         $this->lastSkipReason = null;
 
-        $this->lastRanAt = new \DateTimeImmutable('now');
+        $this->lastRanAt = $now;
         try {
-            $result = ($this->callback)($this);
+            $result = $this->invokeWithRetry();
             $this->lastResult = $result;
             $this->lastError = null;
             $this->lastSuccess = true;
@@ -458,6 +528,12 @@ final class Task
     public function lastSkipReason(): ?string
     {
         return $this->lastSkipReason;
+    }
+
+    /** 任务可读描述（未设置时返回 null）。 */
+    public function getDescription(): ?string
+    {
+        return $this->description;
     }
 
     // ------------------------------------------------------------------
@@ -527,5 +603,50 @@ final class Task
         }
 
         return true;
+    }
+
+    /** 判断 $now 是否落在执行时间窗口内（无窗口则恒为 true）。 */
+    private function inTimeWindow(\DateTimeImmutable $now): bool
+    {
+        if ($this->windowStart === null || $this->windowEnd === null) {
+            return true;
+        }
+        $t = $now->format('H:i');
+        // 普通区间
+        if ($this->windowStart <= $this->windowEnd) {
+            $in = $t >= $this->windowStart && $t <= $this->windowEnd;
+        } else {
+            // 跨午夜区间，如 22:00~06:00
+            $in = $t >= $this->windowStart || $t <= $this->windowEnd;
+        }
+
+        return $this->unlessWindow ? !$in : $in;
+    }
+
+    /** 将 "H:i" / "Hi" 归一化为 "H:i"（两位补零）。 */
+    private function normalizeHi(string $time): string
+    {
+        [$m, $h] = $this->parseTime($time);
+
+        return \sprintf('%02d:%02d', (int) $h, (int) $m);
+    }
+
+    /** 带重试地执行回调；全部失败后抛出最后一次异常。 */
+    private function invokeWithRetry(): mixed
+    {
+        $attempts = $this->retryTimes + 1;
+        $last = null;
+        for ($i = 0; $i < $attempts; $i++) {
+            try {
+                return ($this->callback)($this);
+            } catch (\Throwable $e) {
+                $last = $e;
+                if ($this->retryDelayMs > 0 && $i < $attempts - 1) {
+                    \usleep($this->retryDelayMs * 1000);
+                }
+            }
+        }
+
+        throw $last; // 此处 $last 必然非 null
     }
 }

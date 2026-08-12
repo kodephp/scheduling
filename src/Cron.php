@@ -63,6 +63,9 @@ final class Cron
     /** 每个字段解析后的“允许取值集合”（已去重、已排序）。 */
     private array $allowed;
 
+    /** 规范化后的 5 段原始字符串（宏展开后），用于可读描述。 */
+    private array $normalized = [];
+
     /** 原始表达式字符串（用于报错与展示）。 */
     private string $raw;
 
@@ -95,6 +98,8 @@ final class Cron
             $this->allowed['weekday'][] = 0;
             $this->allowed['weekday'] = array_values(array_unique($this->allowed['weekday']));
         }
+
+        $this->normalized = $segments;
     }
 
     /**
@@ -147,9 +152,9 @@ final class Cron
      */
     public function nextRun(\DateTimeInterface $from): \DateTimeImmutable
     {
-        $cursor = \DateTimeImmutable::createFromInterface($from)
-            ->modify('+1 minute')
-            ->setTime((int) $from->format('H'), (int) $from->format('i'), 0);
+        // 从“下一分钟（秒归零）”开始搜索，确保返回的是严格晚于 $from 的下一次
+        $cursor = \DateTimeImmutable::createFromInterface($from)->modify('+1 minute');
+        $cursor = $cursor->setTime((int) $cursor->format('H'), (int) $cursor->format('i'), 0);
 
         $limit = $cursor->modify('+5 years');
 
@@ -167,6 +172,129 @@ final class Cron
     public function expression(): string
     {
         return $this->raw;
+    }
+
+    /**
+     * 输出人类可读的中文描述（尽力而为；非常规模式会回退为原始表达式）。
+     */
+    public function describe(): string
+    {
+        [$minute, $hour, $day, $month, $weekday] = $this->normalized;
+
+        $parts = [];
+        $wd = $this->describeWeekday($weekday);
+        if ($wd !== '') {
+            $parts[] = $wd;
+        }
+        $mo = $this->describeMonth($month);
+        if ($mo !== '') {
+            $parts[] = $mo;
+        }
+        $dy = $this->describeDay($day);
+        if ($dy !== '') {
+            $parts[] = $dy;
+        }
+        $parts[] = $this->describeTime($minute, $hour);
+
+        return \implode('，', $parts);
+    }
+
+    /** 时间字段的中文描述。 */
+    private function describeTime(string $minute, string $hour): string
+    {
+        $allMin = $this->isAll('minute', 0, 59);
+        $allHour = $this->isAll('hour', 0, 23);
+
+        if ($allMin && $allHour) {
+            return '每分钟';
+        }
+        // 每 n 分钟：分字段为 */n，时字段为 *
+        if ($allHour && \preg_match('#^\*/(\d+)$#', $minute, $m)) {
+            return '每 ' . $m[1] . ' 分钟';
+        }
+        // 整点：分=0，时=*
+        if ($minute === '0' && $allHour) {
+            return '每小时整点';
+        }
+        // 单时刻：分、时均为单值
+        if (!\str_contains($minute, ',') && !\str_contains($hour, ',')
+            && \preg_match('#^\d+$#', $minute) && \preg_match('#^\d+$#', $hour)) {
+            return \sprintf('%02d:%02d', (int) $hour, (int) $minute);
+        }
+        // 每小时第 m 分
+        if ($allHour && \preg_match('#^\d+$#', $minute)) {
+            return '每小时第 ' . $minute . ' 分';
+        }
+        // 某点内的每一分钟
+        if ($allMin && \preg_match('#^\d+$#', $hour)) {
+            return $hour . ' 点内的每一分钟';
+        }
+
+        return '分[' . $minute . '] 时[' . $hour . ']';
+    }
+
+    /** 星期字段的中文描述。 */
+    private function describeWeekday(string $weekday): string
+    {
+        if ($weekday === '*') {
+            return '';
+        }
+        if ($weekday === '1-5') {
+            return '仅工作日';
+        }
+        if ($weekday === '0,6') {
+            return '仅周末';
+        }
+        $names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+        if (\preg_match('#^\d$#', $weekday)) {
+            return '仅' . ($names[(int) $weekday] ?? $weekday);
+        }
+        // 列表或范围
+        $items = \explode(',', $weekday);
+        $mapped = [];
+        foreach ($items as $it) {
+            if (\preg_match('#^(\d+)-(\d+)$#', $it, $r)) {
+                $mapped[] = ($names[(int) $r[1]] ?? $r[1]) . '~' . ($names[(int) $r[2]] ?? $r[2]);
+            } elseif (\preg_match('#^\d$#', $it)) {
+                $mapped[] = $names[(int) $it] ?? $it;
+            } else {
+                $mapped[] = $it;
+            }
+        }
+
+        return '每' . \implode('、', $mapped);
+    }
+
+    /** 月份字段的中文描述。 */
+    private function describeMonth(string $month): string
+    {
+        if ($month === '*') {
+            return '';
+        }
+        if ($month === '1,4,7,10') {
+            return '每季度首月';
+        }
+        if (\preg_match('#^\d+$#', $month)) {
+            return $month . ' 月';
+        }
+
+        return '月份[' . $month . ']';
+    }
+
+    /** 日字段的中文描述。 */
+    private function describeDay(string $day): string
+    {
+        if ($day === '*') {
+            return '';
+        }
+        if ($day === '1') {
+            return '每月 1 号';
+        }
+        if (\preg_match('#^\d+$#', $day)) {
+            return '每月 ' . $day . ' 号';
+        }
+
+        return '日期[' . $day . ']';
     }
 
     /**
