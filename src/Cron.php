@@ -383,6 +383,7 @@ final class Cron
 
             // 解析步进 /n
             $step = 1;
+            $hasStep = false;
             if (str_contains($part, '/')) {
                 [$part, $stepStr] = explode('/', $part, 2);
                 $stepStr = trim($stepStr);
@@ -390,6 +391,7 @@ final class Cron
                     throw CronExpressionError::for($root, \sprintf('字段 "%s" 步进值非法："%s"', $name, $stepStr));
                 }
                 $step = (int) $stepStr;
+                $hasStep = true;
             }
 
             // 区间 a-b 或单值
@@ -403,7 +405,9 @@ final class Cron
             } else {
                 $v = $this->resolveToken($part, $names, $name, $root);
                 $start = $v;
-                $end = $v;
+                // "10/5" 按 Vixie 语义是「从 10 起每 5 个直到字段上限」，
+                // 而不是只有 10 一个值——end 必须扩到区间末端。
+                $end = $hasStep ? $range[1] : $v;
             }
 
             // 边界校验

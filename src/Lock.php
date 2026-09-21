@@ -34,8 +34,9 @@ final class Lock
     {
         $dir = \dirname($this->path);
         if (!\is_dir($dir)) {
-            // 递归创建目录，忽略权限导致的失败（交由后续 fopen 报错）
-            @\mkdir($dir, 0o777, true);
+            // 递归创建目录，忽略权限导致的失败（交由后续 fopen 报错）；
+            // 0777 会把锁目录开放给同机任意用户，收到 0775（仍受 umask 二次收敛）
+            @\mkdir($dir, 0o775, true);
         }
 
         $handle = @\fopen($this->path, 'c');

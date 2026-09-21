@@ -70,6 +70,20 @@ final class Scheduler
     private LoggerInterface $logger;
 
     /**
+     * 进程内时间窗去重表：任务名 => 最近一次派发的时间窗。
+     * 仅守护模式（keepAlive）启用，避免秒级轮询把 5 段（分钟级）表达式打成每分钟 60 次。
+     *
+     * @var array<string, string>
+     */
+    private array $tickFired = [];
+
+    /** 是否启用进程内时间窗去重（由 keepAlive 打开）。 */
+    private bool $tickDedupe = false;
+
+    /** 跨进程派发去重（可选；多节点同时跑同一个 Scheduler 时防重复触发）。 */
+    private ?TickGuard $tickGuard = null;
+
+    /**
      * @param \DateTimeZone|null $timezone 调度器基准时区（用于解析“现在”）
      */
     public function __construct(?\DateTimeZone $timezone = null)
@@ -162,6 +176,19 @@ final class Scheduler
         return $this;
     }
 
+    /**
+     * 启用跨进程派发去重：同一 (任务, 时间窗) 只有一个进程会真正派发。
+     *
+     * 适用场景：多个节点/多个守护实例跑了同一份任务表，且没有做 Leader 选举。
+     * 单机单守护无需开启——keepAlive 自带进程内去重。
+     */
+    public function useTickGuard(string $dir): static
+    {
+        $this->tickGuard = new TickGuard($dir);
+
+        return $this;
+    }
+
     /** 当前执行器（惰性默认 SyncRunner）。 */
     public function runner(): RunnerInterface
     {
@@ -202,6 +229,16 @@ final class Scheduler
     public function task(callable $callback, ?string $name = null): Task
     {
         $name ??= 'task:' . $this->callbackFingerprint($callback);
+
+        // 同一出处生成的多个闭包（如循环注册）指纹相同，加序号区分，
+        // 否则 find()/去重表/锁键都会互相踩
+        if ($this->find($name) !== null) {
+            $i = 2;
+            while ($this->find($name . '#' . $i) !== null) {
+                $i++;
+            }
+            $name .= '#' . $i;
+        }
 
         return $this->register(new Task($name, $callback));
     }
@@ -304,11 +341,17 @@ final class Scheduler
 
                 continue;
             }
+            if (!$this->claimTick($task, $now)) {
+                $this->logger->debug('任务本时间窗已派发过，跳过', ['task' => $task->name()]);
+
+                continue;
+            }
             $runnable[] = $task;
         }
 
         // 3) 交给执行器批量执行（默认同步；可替换为自定义 Runner），单任务失败不影响其余
         $outcomes = $this->runner()->runAll($runnable, $now);
+        $abortOn = null;
         foreach ($outcomes as $outcome) {
             if ($outcome->succeeded()) {
                 $report->addSuccess($outcome->name, $outcome->result);
@@ -325,7 +368,11 @@ final class Scheduler
                     ($this->errorHandler)($failed ?? $outcome->name, $outcome->error);
                 }
                 if ($this->stopOnError) {
-                    throw TaskError::for($outcome->name, '执行失败且已开启 stopOnError', 0, $outcome->error);
+                    // 不再立即 throw：那是「半截报告」——afterRun 钩子不会跑、
+                    // 已执行任务的结果也随异常丢失。改为记名后继续收集完本轮，
+                    // 报告完整落账再抛。
+                    $abortOn = $outcome;
+                    break;
                 }
             }
         }
@@ -338,6 +385,10 @@ final class Scheduler
 
         foreach ($this->afterRuns as $cb) {
             $cb($report);
+        }
+
+        if ($abortOn !== null) {
+            throw TaskError::for($abortOn->name, '执行失败且已开启 stopOnError', 0, $abortOn->error);
         }
 
         return $report;
@@ -374,21 +425,14 @@ final class Scheduler
             \pcntl_signal(\SIGTERM, $stop);
         }
 
+        $this->tickDedupe = true;
         $this->keepRunning = true;
         while ($this->keepRunning) {
             if (\function_exists('pcntl_signal_dispatch')) {
                 \pcntl_signal_dispatch();
             }
             $this->run();
-            // 分片睡眠，便于及时响应信号
-            $elapsed = 0;
-            while ($this->keepRunning && $elapsed < $intervalSeconds) {
-                \sleep(1);
-                $elapsed++;
-                if (\function_exists('pcntl_signal_dispatch')) {
-                    \pcntl_signal_dispatch();
-                }
-            }
+            $this->sleepToNextTick($intervalSeconds);
         }
     }
 
@@ -406,6 +450,55 @@ final class Scheduler
         return $task;
     }
 
+    /**
+     * 睡到下一个「对齐刻点」：以 Unix 纪元为原点、$interval 为步长的整点。
+     *
+     * 旧的「跑完再睡固定秒数」会把执行耗时累积成漂移，越漂越晚，
+     * 迟早整分钟被跳过。对齐墙钟后，60 秒间隔恰好落在每分钟 :00，
+     * 分钟级任务的触发点从此稳定。跑超时也不会补偿式连发。
+     */
+    private function sleepToNextTick(int $interval): void
+    {
+        $next = (\floor(\microtime(true) / $interval) + 1) * $interval;
+
+        while ($this->keepRunning && \microtime(true) < $next) {
+            $remaining = $next - \microtime(true);
+            // 分片睡眠便于及时响应信号
+            \usleep((int) (\min(0.2, \max($remaining, 0.001)) * 1_000_000));
+            if (\function_exists('pcntl_signal_dispatch')) {
+                \pcntl_signal_dispatch();
+            }
+        }
+    }
+
+    /**
+     * 时间窗认领：分钟级（5 段）任务一分钟一个窗，秒级（6 段）任务一秒一个窗。
+     *
+     * 进程内去重在 keepAlive 下自动启用（否则秒级轮询会把分钟级任务打成每分钟 60 次）；
+     * 跨进程去重需显式 useTickGuard()。两者都未启用时恒为认领成功，保持 run() 旧语义。
+     */
+    private function claimTick(Task $task, \DateTimeImmutable $now): bool
+    {
+        if (!$this->tickDedupe && $this->tickGuard === null) {
+            return true;
+        }
+
+        $name = $task->name();
+        $window = $now->format($task->hasSeconds() ? 'Y-m-d H:i:s' : 'Y-m-d H:i');
+
+        if ($this->tickDedupe && ($this->tickFired[$name] ?? null) === $window) {
+            return false;
+        }
+
+        if ($this->tickGuard !== null && !$this->tickGuard->claim($name, $window)) {
+            return false;
+        }
+
+        $this->tickFired[$name] = $window;
+
+        return true;
+    }
+
     /** 为匿名任务生成稳定指纹（用于默认名称）。 */
     private function callbackFingerprint(callable $callback): string
     {
@@ -419,7 +512,15 @@ final class Scheduler
             return \md5($class . '::' . $method);
         }
         if ($callback instanceof \Closure) {
-            return \md5(\spl_object_hash($callback));
+            // spl_object_hash 每次进程启动都不同：任务名会漂移，
+            // 去重表/锁文件/监控面板因此无法跨重启关联。
+            // 闭包的「定义位置（文件+行+作用域类）」才是稳定指纹。
+            $ref = new \ReflectionFunction($callback);
+            $scope = $ref->getClosureScopeClass()?->getName() ?? '';
+            $file = $ref->getFileName() ?: 'eval';
+            $line = (string) ($ref->getStartLine() ?: 0);
+
+            return \md5($scope . '@' . $file . ':' . $line);
         }
         if (\is_object($callback)) {
             return \md5(\get_class($callback));

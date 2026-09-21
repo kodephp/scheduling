@@ -27,6 +27,14 @@ final class FileMutex implements MutexInterface
     ) {
     }
 
+    /**
+     * 尝试获取锁。
+     *
+     * 关于 `$ttlSeconds`：flock 随进程退出由操作系统自动释放，
+     * 「持锁进程死了」在这里不存在，所以本地文件锁无需（也不能）按 TTL 抢占——
+     * 强行到期抢占等于把 withoutOverlapping 的语义打破（长任务会被重叠执行）。
+     * 该参数仅在分布式互斥实现（如 Redis SETNX）中有意义，此处忽略。
+     */
     #[\Override]
     public function acquire(string $key, float $ttlSeconds): bool
     {
@@ -53,12 +61,12 @@ final class FileMutex implements MutexInterface
     /** 把逻辑锁名映射为合法的文件路径。 */
     private function pathFor(string $key): string
     {
-        // 若调用方传入的是“显式文件路径”（含路径分隔符或以 .lock 结尾），则原样使用，
-        // 以兼容 withoutOverlapping('/var/run/xxx.lock') 这类历史用法；
-        // 其余情况（逻辑锁名）映射为临时目录下的安全文件名。
-        if (\str_contains($key, \DIRECTORY_SEPARATOR)
-            || \str_ends_with($key, '.lock')
-            || \str_ends_with($key, '.pid')) {
+        // 「显式路径」直通仅对【绝对路径且不含 .. 段】开放，兼容
+        // withoutOverlapping('/var/run/xxx.lock') 这类历史用法；
+        // 锁名可能来自数据库/外部配置，相对路径与 ../ 穿越一律拒绝，
+        // 落到哈希分支——绝不在调用方控制的任意位置创建/打开文件。
+        if (\str_starts_with($key, \DIRECTORY_SEPARATOR)
+            && !\in_array('..', \explode(\DIRECTORY_SEPARATOR, $key), true)) {
             return $key;
         }
 

@@ -76,6 +76,16 @@ function load_scheduler(string $file): Scheduler
 
 [$command, $options] = parse_args($argv);
 
+// 裸开关写法（如 `--tz` 不带值）会把选项解析成 true，直接喂进强类型签名就是 TypeError。
+// 字符串类选项一律归一化：非字符串回落默认值。
+foreach (['schedule', 'env', 'tz', 'tag'] as $key) {
+    if (!\is_string($options[$key])) {
+        $options[$key] = $key === 'schedule'
+            ? \getcwd() . \DIRECTORY_SEPARATOR . 'schedule.php'
+            : '';
+    }
+}
+
 if (!\in_array($command, ['run', 'list', 'next'], true)) {
     \fwrite(\STDERR, "未知命令：$command（可用 run / list / next）\n");
     exit(1);
@@ -88,12 +98,12 @@ if ($options['tz'] !== '') {
 if ($options['env'] !== '') {
     $scheduler->environment($options['env']);
 }
-if ($options['verbose'] !== false) {
+if (\filter_var($options['verbose'], FILTER_VALIDATE_BOOLEAN)) {
     $scheduler->setLogger(new SimpleLogger());
 }
 
 $now = new \DateTimeImmutable('now', new \DateTimeZone(\date_default_timezone_get()));
-$tags = $options['tag'] === '' ? [] : \explode(',', (string) $options['tag']);
+$tags = $options['tag'] === '' ? [] : \explode(',', $options['tag']);
 
 match ($command) {
     'run' => run_command($scheduler, $now, $tags),
