@@ -3,7 +3,7 @@
 通用 Cron 调度库（**PHP 8.4+**）。支持任意 `callable` / `task` / `command`，命名简短无冲突，
 健壮可扩展，**完全自包含、零外部依赖**——不绑定任何第三方调度/并发/分布式包。
 
-> 仓库：`https://github.com/kodephp/scheduling` ｜ 许可：MIT ｜ 最低版本：PHP 8.3
+> 仓库：`https://github.com/kodephp/scheduling` ｜ 许可：MIT ｜ 最低版本：PHP 8.4
 
 ---
 
@@ -299,7 +299,7 @@ $scheduler->useTickGuard('/shared/nfs-dir/ks-ticks');
   锁键中的相对路径与 `../` 段一律拒绝直通（防锁文件穿越写入），只有干净的绝对路径按原样使用。
 - **时区清晰**：cron 字段始终按任务自身时区解释；`nextRun()`/`describe()` 同样遵循该时区。
 - **不可变结果**：`TaskOutcome` 用只读属性与 `TaskStatus` 枚举承载终态，跨执行模型也安全。
-- **零依赖**：仅依赖 PHP 8.3 标准库，不引入任何 `composer` 额外依赖。
+- **零依赖**：仅依赖 PHP 8.4 标准库，不引入任何 `composer` 额外依赖。
 
 ---
 
