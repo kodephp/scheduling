@@ -1,5 +1,6 @@
 {
     "name": "kode/scheduling",
+    "version": "1.4.0",
     "description": "通用 Cron 调度器：支持任意 callable / task 的简洁健壮 PHP 定时任务库",
     "type": "library",
     "license": "MIT",
