@@ -1,6 +1,6 @@
 # kode/scheduling
 
-通用 Cron 调度库（**PHP 8.3+**）。支持任意 `callable` / `task` / `command`，命名简短无冲突，
+通用 Cron 调度库（**PHP 8.4+**）。支持任意 `callable` / `task` / `command`，命名简短无冲突，
 健壮可扩展，**完全自包含、零外部依赖**——不绑定任何第三方调度/并发/分布式包。
 
 > 仓库：`https://github.com/kodephp/scheduling` ｜ 许可：MIT ｜ 最低版本：PHP 8.3
