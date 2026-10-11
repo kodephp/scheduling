@@ -1,6 +1,6 @@
 {
     "name": "kode/scheduling",
-    "version": "2.0.2",
+    "version": "2.0.3",
     "description": "通用 Cron 调度器：支持任意 callable / task 的简洁健壮 PHP 定时任务库",
     "type": "library",
     "license": "MIT",
@@ -20,8 +20,15 @@
     "require": {
         "php": "^8.4"
     },
+    "suggest": {
+        "ext-pcntl": "PCNTL 扩展 - 用于进程信号优雅退出/并发"
+    },
     "require-dev": {
         "phpunit/phpunit": "^11.0"
+    },
+    "support": {
+        "issues": "https://github.com/kodephp/scheduling/issues",
+        "source": "https://github.com/kodephp/scheduling"
     },
     "autoload": {
         "psr-4": {
