@@ -434,7 +434,7 @@ final class Cron
      * @param array<string,int> $names
      * @throws CronExpressionError
      */
-    private function resolveToken(string $token, array $names, string $name, string $root): int
+    private function resolveToken(#[\SensitiveParameter] string $token, array $names, string $name, string $root): int
     {
         if (isset($names[strtoupper($token)])) {
             return $names[strtoupper($token)];
