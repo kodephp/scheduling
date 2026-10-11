@@ -17,6 +17,7 @@ class TaskError extends SchedulingError
      * @param int            $code     错误码
      * @param \Throwable|null $previous 上游异常
      */
+    #[\Override]
     public static function for(string $taskName, string $reason, int $code = 0, ?\Throwable $previous = null): self
     {
         return new self(\sprintf('任务 "%s" 出错：%s', $taskName, $reason), $code, $previous);

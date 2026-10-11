@@ -17,6 +17,7 @@ class CronExpressionError extends SchedulingError
      * @param int            $code       错误码
      * @param \Throwable|null $previous   上游异常
      */
+    #[\Override]
     public static function for(string $expression, string $reason, int $code = 0, ?\Throwable $previous = null): self
     {
         return new self(\sprintf('非法的 Cron 表达式 "%s"：%s', $expression, $reason), $code, $previous);
