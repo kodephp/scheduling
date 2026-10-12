@@ -270,13 +270,7 @@ final class Scheduler
     /** 按名称查找任务；不存在返回 null。 */
     public function find(string $name): ?Task
     {
-        foreach ($this->tasks as $task) {
-            if ($task->name() === $name) {
-                return $task;
-            }
-        }
-
-        return null;
+        return array_find($this->tasks, fn($task) => $task->name() === $name);
     }
 
     /** 返回在 $now 到期且应执行的任务（尚未真正运行）。可按标签过滤。 */
@@ -532,24 +526,12 @@ final class Scheduler
     /** 任务是否带任一指定标签。 */
     private function taskHasAnyTag(Task $task, array $tags): bool
     {
-        foreach ($tags as $tag) {
-            if (\in_array($tag, $task->tags(), true)) {
-                return true;
-            }
-        }
-
-        return false;
+        return array_any($tags, fn($tag) => \in_array($tag, $task->tags(), true));
     }
 
     /** 是否存在“秒级（6 段）”任务——用于守护循环自动提升轮询精度。 */
     private function hasSecondPrecisionTasks(): bool
     {
-        foreach ($this->tasks as $task) {
-            if ($task->hasSeconds()) {
-                return true;
-            }
-        }
-
-        return false;
+        return array_any($this->tasks, fn($task) => $task->hasSeconds());
     }
 }

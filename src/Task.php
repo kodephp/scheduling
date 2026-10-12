@@ -786,18 +786,8 @@ final class Task
     /** 条件钩子是否允许执行。 */
     private function allowedByConditions(): bool
     {
-        foreach ($this->whens as $cb) {
-            if (!($cb)($this)) {
-                return false;
-            }
-        }
-        foreach ($this->skipWhens as $cb) {
-            if (($cb)($this)) {
-                return false;
-            }
-        }
-
-        return true;
+        return array_all($this->whens, fn($cb) => ($cb)($this))
+            && array_all($this->skipWhens, fn($cb) => !(($cb)($this)));
     }
 
     /** 判断 $now 是否落在执行时间窗口内（无窗口则恒为 true）。 */

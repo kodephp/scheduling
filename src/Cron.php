@@ -452,12 +452,7 @@ final class Cron
         if (count($allowed) !== ($max - $min + 1)) {
             return false;
         }
-        foreach ($allowed as $v) {
-            if ($v < $min || $v > $max) {
-                return false;
-            }
-        }
-        return true;
+        return array_all($allowed, fn($v) => !($v < $min || $v > $max));
     }
 
     /** 判断某值是否在该字段的允许集合中。 */
