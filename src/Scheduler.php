@@ -499,7 +499,7 @@ final class Scheduler
         if (\is_string($callback)) {
             return \md5($callback);
         }
-        if (\is_array($callback) && \count($callback) === 2) {
+        if (\is_array($callback)) { // callable 数组形态恒为 2 元组，count 过滤为死代码
             [$obj, $method] = $callback;
             $class = \is_object($obj) ? \get_class($obj) : $obj;
 

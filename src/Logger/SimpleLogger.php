@@ -44,6 +44,7 @@ final class SimpleLogger implements LoggerInterface
     }
 
     /** 统一写出；非 TTY 环境（如管道）也安全。 */
+    /** @param resource $stream */
     private function write(string $level, string $message, array $context, $stream): void
     {
         if (!$this->echo) {

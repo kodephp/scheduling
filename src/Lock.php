@@ -15,6 +15,7 @@ namespace Kode\Scheduling;
  */
 final class Lock
 {
+    /** @var resource|null flock 句柄 */
     private $handle = null;
 
     /**

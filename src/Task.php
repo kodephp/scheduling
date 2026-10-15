@@ -717,16 +717,6 @@ final class Task
         return $this->hasSeconds ? 2 : 1;
     }
 
-    private function idxDay(): int
-    {
-        return $this->hasSeconds ? 3 : 2;
-    }
-
-    private function idxMonth(): int
-    {
-        return $this->hasSeconds ? 4 : 3;
-    }
-
     private function idxWeekday(): int
     {
         return $this->hasSeconds ? 5 : 4;
